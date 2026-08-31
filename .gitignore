@@ -1,6 +1,18 @@
+# 依赖
 node_modules/
+
+# 构建产物
 dist/
-config.json
 .wrangler/
-*.log
+
+# 运行时配置 (含敏感凭证, 严禁提交)
+config.json
+*.env
 .credentials/
+
+# 日志
+*.log
+
+# 系统
+.DS_Store
+Thumbs.db

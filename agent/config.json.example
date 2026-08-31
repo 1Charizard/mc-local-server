@@ -1,5 +1,5 @@
 {
-  "workerUrl": "wss://mc1life-panel.pages.dev/ws/agent",
+  "workerUrl": "wss://YOUR_PANEL.pages.dev/ws/agent",
   "token": "REPLACE_WITH_SHARED_SECRET",
   "agentId": "mc1life",
   "bds": {

@@ -74,30 +74,25 @@ cd /opt/mc1life/agent && node src/index.js
 - 玩家连接地址：`[手机全局IPv6]:19133`（脚本会自动打印）
 - 若玩家端无 IPv6：可改用 frp 免费服务 UDP 穿透（见 PLAN.md）
 
-### 二、Cloudflare 侧资源（已完成 ✅）
+### 二、Cloudflare 侧资源
 
-面板已上线：https://mc1life-panel.pages.dev（登录密码在 `.credentials/agent.env`）
-Worker 已上线：https://mc1life-api.mc1life.workers.dev
-如需重新发布：`bash deploy/cf_publish.sh`（需先启用 R2）
+面板发布到 CF Pages（默认项目名 `mc1life-panel`），Worker 发布到 CF Workers（`mc1life-api`）。
+执行 `bash deploy/cf_publish.sh <你的域名> <R2_KEY_ID> <R2_SECRET>` 自动创建资源并发布。
+面板鉴权 token / Agent token 用 `wrangler secret put` 注入（见 `deploy/cf_status.md`）。
 
 ### 三、回填 Agent 配置
 
-编辑主机上 `/opt/mc1life/agent/config.json`：
+编辑主机上 `/opt/mc1life/agent/config.json`（参考 `config.json.example`）：
 
 ```json
 {
-  "workerUrl": "wss://api.<域名>/ws/agent",
-  "token": "<Agent共享密钥>",
-  "r2": {
-    "endpoint": "https://<ACCOUNT_ID>.r2.cloudflarestorage.com",
-    "accessKeyId": "<R2_KEY_ID>",
-    "secretAccessKey": "<R2_SECRET>",
-    "bucket": "mc1life-backups"
-  }
+  "workerUrl": "wss://<你的面板域名>.pages.dev/ws/agent",
+  "token": "<Agent共享密钥, 与 Worker 的 AGENT_TOKEN secret 一致>",
+  "agentId": "mc1life"
 }
 ```
 
-重启 Agent：`systemctl restart mc1life-agent`
+重启 Agent：`systemctl restart mc1life-agent`（或 Termux 下 `bash /opt/mc1life/start_agent.sh`）
 
 ### 四、行为包（可选，复用 Actions-and-Stuff）
 
