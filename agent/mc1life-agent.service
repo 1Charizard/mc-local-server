@@ -1,0 +1,18 @@
+[Unit]
+Description=MC1life Agent - Minecraft Server Manager
+After=network.target mc1life-bds.service
+Wants=mc1life-bds.service
+
+[Service]
+Type=simple
+User=mc1life
+Group=mc1life
+WorkingDirectory=/opt/mc1life/agent
+ExecStart=/usr/bin/node src/index.js
+Restart=always
+RestartSec=5
+Environment=MC1LIFE_CONFIG=/opt/mc1life/agent/config.json
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target

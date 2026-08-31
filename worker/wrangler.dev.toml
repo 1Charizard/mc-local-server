@@ -1,0 +1,9 @@
+# 本地开发配置 (无 R2/D1/KV 绑定, 用于 wrangler dev 联调)
+name = "mc1life-api-dev"
+main = "src/index.js"
+compatibility_date = "2024-06-01"
+
+[vars]
+AGENT_TOKEN = "test-token"
+PANEL_JWT_SECRET = "test-jwt"
+ALLOWED_AGENT_ID = "mc1life-test"

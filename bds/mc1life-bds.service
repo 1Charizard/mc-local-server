@@ -1,0 +1,20 @@
+[Unit]
+Description=MC1life - Minecraft Bedrock Dedicated Server 1.21.90
+After=network.target
+
+[Service]
+Type=simple
+User=mc1life
+Group=mc1life
+WorkingDirectory=/opt/mc1life/bds
+ExecStart=/opt/mc1life/bds/run.sh
+Restart=on-failure
+RestartSec=5
+# BDS 内存占用 1-4GB, 按需调整
+LimitNOFILE=65536
+# 日志交给 agent 处理 (stdout 会被 agent 捕获), 这里不需要 journald
+StandardOutput=inherit
+StandardError=inherit
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,32 @@
+{
+  "workerUrl": "wss://mc1life-panel.pages.dev/ws/agent",
+  "token": "REPLACE_WITH_SHARED_SECRET",
+  "agentId": "mc1life",
+  "bds": {
+    "dir": "/opt/mc1life/bds",
+    "runScript": "/opt/mc1life/bds/run.sh",
+    "worldDir": "/opt/mc1life/bds/worlds",
+    "startTimeoutMs": 90000
+  },
+  "rcon": {
+    "host": "127.0.0.1",
+    "port": 25575,
+    "password": "CHANGE_ME_STRONG_PASSWORD"
+  },
+  "r2": {
+    "endpoint": "https://YOUR_ACCOUNT_ID.r2.cloudflarestorage.com",
+    "accessKeyId": "REPLACE_WITH_R2_ACCESS_KEY",
+    "secretAccessKey": "REPLACE_WITH_R2_SECRET",
+    "bucket": "mc1life-backups"
+  },
+  "backup": {
+    "auto": true,
+    "intervalMinutes": 360,
+    "keep": 5,
+    "includeDirs": ["worlds", "server.properties", "whitelist.json", "permissions.json", "allowlist.json"]
+  },
+  "hardcore": {
+    "enabled": true,
+    "mode": "wipe"
+  }
+}

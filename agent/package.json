@@ -1,0 +1,16 @@
+{
+  "name": "mc1life-agent",
+  "version": "1.0.0",
+  "description": "MC1life 服务器管理代理 - 运行在 BDS 主机上, 通过 WebSocket 出站连接 Cloudflare Worker",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test test/"
+  },
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.600.0",
+    "@aws-sdk/lib-storage": "^3.600.0",
+    "ws": "^8.17.0"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "name": "mc1life-worker",
+  "version": "1.0.0",
+  "description": "MC1life Cloudflare Worker - REST API + WebSocket 网关 (面板<->Agent)",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:init": "wrangler d1 execute mc1life --file=./schema.sql --remote"
+  },
+  "dependencies": {
+    "hono": "^4.4.0"
+  },
+  "devDependencies": {
+    "wrangler": "^3.60.0"
+  }
+}
