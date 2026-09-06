@@ -437,7 +437,7 @@ app.post('/api/worlds/upload', async (c) => {
   if (buf.byteLength === 0) return c.json({ ok: false, error: '文件为空' }, 400);
   const MAX = 90 * 1024 * 1024;
   if (buf.byteLength > MAX) return c.json({ ok: false, error: `文件过大 (${(buf.byteLength/1048576).toFixed(1)}MB), 上限 90MB` }, 400);
-  const CHUNK = 1536 * 1024;
+  const CHUNK = 716 * 1024;   // D1 staging 单行安全 (base64 ~955KB < 1MB)
   const uploadId = crypto.randomUUID().slice(0, 8);
   const total = Math.ceil(buf.byteLength / CHUNK);
   const baseName = name.replace(/\.(zip|mcworld|tar\.gz|tgz)$/i, '').replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 60) || 'uploaded_world';
@@ -452,9 +452,10 @@ app.post('/api/worlds/upload', async (c) => {
   return c.json(r);
 });
 
-// ---- 前端分片上传 (绕开 CF 100MB 单请求限制, 上限 500MB; R2 暂存) ----
+// ---- 前端分片上传 (绕开 CF 100MB 单请求限制, 上限 500MB; D1 staging 暂存) ----
 const MAX_UPLOAD = 500 * 1024 * 1024;
-const UPLOAD_CHUNK = 1536 * 1024;
+const UPLOAD_CHUNK = 716 * 1024;  // base64 ~955KB < D1 单行 1MB 安全线
+const MAX_CHUNK_B64 = 1.05 * 1024 * 1024;  // 拒绝超大分片 (D1 行上限保护)
 
 app.post('/api/worlds/upload/start', async (c) => {
   const { fileName, size } = await c.req.json().catch(() => ({}));
@@ -483,7 +484,10 @@ app.post('/api/worlds/upload/chunk', async (c) => {
   if (index < 0 || index >= meta.totalChunks) return c.json({ ok: false, error: '分片越界' }, 400);
   const buf = new Uint8Array(await c.req.arrayBuffer());
   if (buf.byteLength === 0) return c.json({ ok: false, error: '分片为空' }, 400);
-  await stagePut(c.env, r2u('upload', uploadId, `chunk/${index}`), bytesToB64(buf));
+  if (buf.byteLength > 716 * 1024) return c.json({ ok: false, error: `分片过大 (>716KB), 请刷新后重试` }, 400);
+  const b64 = bytesToB64(buf);
+  if (b64.length > MAX_CHUNK_B64) return c.json({ ok: false, error: '分片编码过大, 请刷新后重试' }, 400);
+  await stagePut(c.env, r2u('upload', uploadId, `chunk/${index}`), b64);
   return c.json({ ok: true, received: index + 1, total: meta.totalChunks });
 });
 
@@ -503,6 +507,72 @@ app.post('/api/worlds/upload/finish', async (c) => {
   await c.env.DB.prepare('INSERT INTO tasks (id, type, status, payload) VALUES (?, ?, ?, ?)')
     .bind(tid, 'cmd', 'pending', tpayload).run().catch(() => {});
   return c.json({ ok: true, pending: true, message: '已提交导入, Agent 后台处理中, 稍后刷新世界列表' });
+});
+
+// ---- 世界重命名 ----
+app.post('/api/worlds/rename', async (c) => {
+  const { oldName, newName } = await c.req.json().catch(() => ({}));
+  if (!oldName || !newName) return c.json({ ok: false, error: '缺少参数 (oldName/newName)' }, 400);
+  await logAudit(c.env, 'admin', 'world_rename', `${oldName} -> ${newName}`);
+  const r = await submitCmd(c.env, 'renameWorld', { oldName, newName }, 90000);
+  return c.json(r);
+});
+
+// ---- 世界包管理 (行为包/材质包, 按世界隔离) ----
+app.get('/api/worlds/packs', async (c) => {
+  const world = c.req.query('world') || '';
+  if (!world) return c.json({ ok: false, error: '缺少 world' }, 400);
+  const r = await submitCmd(c.env, 'listWorldPacks', { world }, 30000);
+  return c.json(r);
+});
+app.post('/api/worlds/packs/toggle', async (c) => {
+  const { world, uuid, enabled } = await c.req.json().catch(() => ({}));
+  if (!world || !uuid || typeof enabled !== 'boolean') return c.json({ ok: false, error: '缺少参数 (world/uuid/enabled)' }, 400);
+  await logAudit(c.env, 'admin', 'pack_toggle', `${world} ${uuid} -> ${enabled}`);
+  const r = await submitCmd(c.env, 'worldPackToggle', { world, uuid, enabled }, 30000);
+  return c.json(r);
+});
+app.post('/api/worlds/packs/delete', async (c) => {
+  const { world, uuid } = await c.req.json().catch(() => ({}));
+  if (!world || !uuid) return c.json({ ok: false, error: '缺少参数 (world/uuid)' }, 400);
+  await logAudit(c.env, 'admin', 'pack_delete', `${world} ${uuid}`);
+  const r = await submitCmd(c.env, 'worldPackDelete', { world, uuid }, 30000);
+  return c.json(r);
+});
+// 包分片上传: start (带 world + type 可选) -> 复用 /api/worlds/upload/chunk -> finish
+app.post('/api/packs/upload/start', async (c) => {
+  const { fileName, size, world, type } = await c.req.json().catch(() => ({}));
+  if (!fileName || !size || !world) return c.json({ ok: false, error: '缺少参数 (fileName/size/world)' }, 400);
+  if (size > MAX_UPLOAD) return c.json({ ok: false, error: `文件过大 (${(size/1048576).toFixed(1)}MB), 上限 500MB` }, 400);
+  if (size <= 0) return c.json({ ok: false, error: '文件为空' }, 400);
+  if (type && !['behavior', 'resource'].includes(type)) return c.json({ ok: false, error: 'type 仅支持 behavior/resource' }, 400);
+  if (!(await agentOnline(c.env))) return c.json({ ok: false, error: 'Agent 当前离线, 无法上传包' }, 503);
+  const uploadId = crypto.randomUUID().slice(0, 8);
+  const totalChunks = Math.ceil(size / UPLOAD_CHUNK);
+  const meta = { uploadId, fileName, world, type: type || '', size, totalChunks, ts: Date.now(), kind: 'pack' };
+  try {
+    await stagePut(c.env, r2u('upload', uploadId, 'meta.json'), JSON.stringify(meta));
+  } catch (e) {
+    return c.json({ ok: false, error: 'start-stage: ' + e.name + ' ' + e.message }, 500);
+  }
+  return c.json({ ok: true, uploadId, totalChunks });
+});
+app.post('/api/packs/upload/finish', async (c) => {
+  const { uploadId } = await c.req.json().catch(() => ({}));
+  if (!uploadId) return c.json({ ok: false, error: '缺少 uploadId' }, 400);
+  const meta = await r2GetMeta(c.env, 'upload', uploadId);
+  if (!meta || meta.kind !== 'pack') return c.json({ ok: false, error: '包上传会话不存在或已过期' }, 404);
+  for (let i = 0; i < meta.totalChunks; i++) {
+    const o = await r2Head(c.env, r2u('upload', uploadId, `chunk/${i}`));
+    if (o === null) return c.json({ ok: false, error: `分片缺失 (${i}/${meta.totalChunks})` }, 500);
+  }
+  if (!(await agentOnline(c.env))) return c.json({ ok: false, error: 'Agent 当前离线, 无法导入包' }, 503);
+  await logAudit(c.env, 'admin', 'pack_upload', `${meta.world} ${meta.fileName} (${(meta.size/1048576).toFixed(1)}MB)`);
+  const tid = crypto.randomUUID();
+  const tpayload = JSON.stringify({ kind: 'packImportUpload', payload: { uploadId, fileName: meta.fileName, world: meta.world, type: meta.type, totalChunks: meta.totalChunks } });
+  await c.env.DB.prepare('INSERT INTO tasks (id, type, status, payload) VALUES (?, ?, ?, ?)')
+    .bind(tid, 'cmd', 'pending', tpayload).run().catch(() => {});
+  return c.json({ ok: true, pending: true, message: '已提交包安装, Agent 后台处理中' });
 });
 
 // 硬核模式配置

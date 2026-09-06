@@ -40,6 +40,7 @@ const routes = [
   { path: '/console', meta: { title: '💻 控制台' } },
   { path: '/players', meta: { title: '👥 玩家管理' } },
   { path: '/worlds', meta: { title: '🗺️ 存档管理' } },
+  { path: '/packs', meta: { title: '🧩 包管理' } },
   { path: '/backups', meta: { title: '💾 备份回滚' } },
   { path: '/settings', meta: { title: '⚙️ 服务器设置' } },
 ];

@@ -64,6 +64,49 @@ class Worlds {
     return { switchedTo: name };
   }
 
+  /** 重命名世界 (目录 + levelname.txt + 当前世界时同步 server.properties) */
+  async rename(oldName, newName) {
+    if (!oldName || typeof oldName !== 'string') throw new Error('缺少旧世界名');
+    const clean = this._sanitizeName(newName);
+    if (!clean || clean === '.' || clean.startsWith('..')) throw new Error('非法世界名');
+    if (oldName.includes('/') || oldName.includes('\\') || oldName === '.' || oldName === '..') {
+      throw new Error('非法旧世界名');
+    }
+    const oldDir = path.join(this.worldDir, oldName);
+    const realDir = fs.realpathSync(this.worldDir);
+    if (fs.existsSync(oldDir)) {
+      const realOld = fs.realpathSync(oldDir);
+      if (!realOld.startsWith(realDir + path.sep)) throw new Error('非法路径, 拒绝重命名');
+    }
+    if (!fs.existsSync(oldDir)) throw new Error(`世界不存在: ${oldName}`);
+    if (clean === oldName) return { renamed: oldName, ok: true, changed: false };
+    const newDir = path.join(this.worldDir, clean);
+    if (fs.existsSync(newDir)) throw new Error(`已存在同名世界: ${clean}`);
+
+    // 读 props, 判断是否当前世界
+    const props = await this._readProps();
+    const current = (props['level-name'] || 'Bedrock level').replace(/\r/g, '');
+    const isCurrent = oldName === current;
+
+    fs.renameSync(oldDir, newDir);
+    // 同步 levelname.txt (玩家看到的显示名)
+    const lnPath = path.join(newDir, 'levelname.txt');
+    try { fs.writeFileSync(lnPath, clean, 'utf8'); } catch {}
+    // 若为当前世界, 更新 server.properties 并重启
+    let restarted = false;
+    if (isCurrent) {
+      props['level-name'] = clean;
+      await this._writeProps(path.join(this.cfg.dir, 'server.properties'), props);
+      if (this.bds.running) {
+        await this.bds.restart();
+        restarted = true;
+      }
+    }
+    await this.refreshCache();
+    console.log(`[MC1life] 世界已重命名: ${oldName} -> ${clean}${restarted ? ' (当前世界, 已重启)' : ''}`);
+    return { renamed: clean, ok: true, changed: true, restarted };
+  }
+
   /** 删除世界 (仅非当前世界, 路径防逃逸) */
   async delete(name) {
     if (!name || typeof name !== 'string') throw new Error('缺少世界名');

@@ -132,6 +132,56 @@ export async function uploadWorldFile(file, name, onProgress) {
     // 附带 start 阶段的 worldName (供前端轮询判断新世界是否出现)
     return { ...fin, worldName: st.worldName };
 }
+// 通用分片上传 (world/pack 共用 chunk 端点; start/finish 路径自定义)
+export async function uploadChunked(startPath, finishPath, file, meta, onProgress) {
+  const MAX = 500 * 1024 * 1024;
+  const CHUNK = 716 * 1024;  // 上传分片 716KB (base64 ~955KB 存 D1 staging, 单行安全)
+  if (file.size > MAX) throw new Error(`文件过大 (${(file.size/1048576).toFixed(1)}MB), 上限 500MB`);
+  if (file.size === 0) throw new Error('文件为空');
+  const fileName = (file.name || 'upload.zip').replace(/[\\/:*?"<>|]/g, '');
+  const st = await req(startPath, { method: 'POST', body: JSON.stringify({ fileName, size: file.size, ...meta }) });
+  const { uploadId, totalChunks } = st;
+  const token = getAuthToken();
+  for (let i = 0; i < totalChunks; i++) {
+    const slice = file.slice(i * CHUNK, Math.min((i + 1) * CHUNK, file.size));
+    const buf = await slice.arrayBuffer();
+    let lastErr = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const ac = new AbortController();
+        const timer = setTimeout(() => ac.abort(), 60000);
+        const res = await fetch(`${API_BASE}/api/worlds/upload/chunk?id=${uploadId}&i=${i}`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}` },
+          body: buf,
+          signal: ac.signal,
+        });
+        clearTimeout(timer);
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || data.ok === false) throw new Error(data.error || `分片 ${i + 1}/${totalChunks} 上传失败`);
+        lastErr = null;
+        break;
+      } catch (e) {
+        lastErr = e;
+        if (attempt < 3) {
+          await new Promise(r => setTimeout(r, 1000 * attempt));
+          if (onProgress) onProgress(Math.round(((i) / totalChunks) * 95), i, totalChunks);
+        }
+      }
+    }
+    if (lastErr) throw new Error(`分片 ${i + 1}/${totalChunks} 上传失败: ${lastErr.message} (已重试 3 次, 请检查网络后重试)`);
+    if (onProgress) onProgress(Math.round(((i + 1) / totalChunks) * 95), i + 1, totalChunks);
+  }
+  const fin = await req(finishPath, { method: 'POST', body: JSON.stringify({ uploadId }) });
+  if (onProgress) onProgress(100, totalChunks, totalChunks);
+  return { ...fin, worldName: meta.worldName || st.worldName || '' };
+}
+export const renameWorld = (oldName, newName) => req('/api/worlds/rename', { method: 'POST', body: JSON.stringify({ oldName, newName }) });
+export const getWorldPacks = (world) => req(`/api/worlds/packs?world=${encodeURIComponent(world)}`);
+export const toggleWorldPack = (world, uuid, enabled) => req('/api/worlds/packs/toggle', { method: 'POST', body: JSON.stringify({ world, uuid, enabled }) });
+export const deleteWorldPack = (world, uuid) => req('/api/worlds/packs/delete', { method: 'POST', body: JSON.stringify({ world, uuid }) });
+export const uploadPackFile = (world, type, file, onProgress) =>
+  uploadChunked('/api/packs/upload/start', '/api/packs/upload/finish', file, { world, type: type || '' }, onProgress);
 export const getHardcore = () => req('/api/hardcore');
 export const setHardcore = (enabled, mode) => req('/api/hardcore', { method: 'POST', body: JSON.stringify({ enabled, mode }) });
 export const getConfig = (file) => req(`/api/config?file=${encodeURIComponent(file || 'server.properties')}`);

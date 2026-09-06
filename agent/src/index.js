@@ -30,6 +30,8 @@ const bds = new BDS(config.bds, { rcon: rconTCP });
 const rcon = { exec: (cmd, timeoutMs) => bds.exec(cmd, timeoutMs) };
 const backup = new Backup(config.bds, config.r2, config.backup, bds, rcon);
 const worlds = new Worlds(config.bds, bds);
+const Packs = require('./packs');
+const packs = new Packs(config.bds, bds);
 const cfg = new Config(config.bds);
 const hardcore = new Hardcore(config.hardcore, { bds, rcon, backup, send });
 hardcore.start();
@@ -136,6 +138,11 @@ async function dispatch(kind, p) {
     case 'worldImportUpload': return handleWorldImportUpload(p);
     case 'worldUploadChunk': return handleUploadChunk(p);
     case 'worldUploadFinish': return handleUploadFinish(p);
+    case 'renameWorld': return await worlds.rename(p.oldName, p.newName);
+    case 'listWorldPacks': return packs.list(p.world);
+    case 'worldPackToggle': return packs.toggle(p.world, p.uuid, !!p.enabled);
+    case 'worldPackDelete': return packs.remove(p.world, p.uuid);
+    case 'packImportUpload': return handlePackImportUpload(p);
     case 'getConfig': return await cfg.getAll(p.file || 'server.properties');
     case 'setConfig': return await cfg.set(p.file || 'server.properties', p.key, p.value, { restart: !!p.restart });
     case 'getFiles': return await cfg.listFiles();
@@ -220,11 +227,8 @@ async function exportWorld(worldName) {
 // ---------- 网页上传: 新版走 Agent 主动拉取 KV 分片 ----------
 // Worker 端: upload 存 KV (meta + chunk:i), 入队 worldImportUpload
 // Agent 端: 拉取指令后, 用 HTTP 拉取分片拼接导入
-async function handleWorldImportUpload(p) {
-  const { uploadId, fileName, worldName, totalChunks } = p || {};
-  if (!uploadId || !totalChunks) throw new Error('缺少上传参数');
-  console.log(`[MC1life] 拉取存档分片: ${uploadId} (${totalChunks} 片, ${fileName})`);
-  // 从 Worker KV 拉取分片 (并发 8, 500MB 世界 ~334 片串行太慢)
+// 拉取全部上传分片并拼接为本地文件 (world/pack 通用)
+async function pullUploadChunks(uploadId, totalChunks, fileName) {
   const base = poll._base();
   const mod = base.startsWith('https') ? require('https') : require('http');
   const fetchChunk = (i) => new Promise((resolve, reject) => {
@@ -251,28 +255,62 @@ async function handleWorldImportUpload(p) {
   const full = Buffer.concat(chunks);
   const dir = '/opt/mc1life/uploads';
   fs.mkdirSync(dir, { recursive: true });
-  const ext = (fileName || 'world.zip').match(/\.(zip|tar\.gz|tgz|mcworld)$/i)?.[0] || '.zip';
+  const ext = (fileName || 'upload.zip').match(/\.(zip|tar\.gz|tgz|mcworld|mcpack)$/i)?.[0] || '.zip';
   const tmpFile = `${dir}/upload_${Date.now()}${ext}`;
   fs.writeFileSync(tmpFile, full);
   console.log(`[MC1life] 存档分片拼接完成, ${(full.length / 1048576).toFixed(1)}MB -> ${tmpFile}`);
+  return tmpFile;
+}
+
+async function cleanupUploadChunks(uploadId) {
+  const base = poll._base();
+  try {
+    await new Promise((resolve) => {
+      const mod = base.startsWith('https') ? require('https') : require('http');
+      const req = mod.request(`${base}/api/agent/upload/${uploadId}/cleanup?agent=${encodeURIComponent(config.agentId)}&token=${encodeURIComponent(config.token)}`, { method: 'POST' }, resolve);
+      req.on('error', () => {});
+      req.end();
+    });
+  } catch {}
+}
+
+async function handleWorldImportUpload(p) {
+  const { uploadId, fileName, worldName, totalChunks } = p || {};
+  if (!uploadId || !totalChunks) throw new Error('缺少上传参数');
+  console.log(`[MC1life] 拉取存档分片: ${uploadId} (${totalChunks} 片, ${fileName})`);
+  const tmpFile = await pullUploadChunks(uploadId, totalChunks, fileName);
   try {
     const result = await worlds.importLocal(tmpFile, worldName || 'uploaded_world');
     console.log(`[MC1life] 存档导入完成: ${result.world}`);
     worlds.refreshCache();
-    // 清理 KV 暂存分片
-    try {
-      await new Promise((resolve) => {
-        const mod = base.startsWith('https') ? require('https') : require('http');
-        const req = mod.request(`${base}/api/agent/upload/${uploadId}/cleanup?agent=${encodeURIComponent(config.agentId)}&token=${encodeURIComponent(config.token)}`, { method: 'POST' }, resolve);
-        req.on('error', () => {});
-        req.end();
-      });
-    } catch {}
+    await cleanupUploadChunks(uploadId);
     return { ok: true, world: result.world, note: bds.running ? '服务器运行中, 请在面板切换到该世界' : undefined };
   } catch (e) {
     // 失败时保留拼接文件 (uploads/inspect_*), 供诊断: 文件格式/完整性
     const keep = `/opt/mc1life/uploads/inspect_${uploadId}${path.extname(tmpFile) || '.bin'}`;
     try { fs.renameSync(tmpFile, keep); console.log(`[MC1life] 导入失败, 已保留文件供诊断: ${keep}`); }
+    catch { try { fs.unlinkSync(tmpFile); } catch {} }
+    throw e;
+  } finally {
+    try { fs.unlinkSync(tmpFile); } catch {}
+  }
+}
+
+// 行为/材质包上传: 分片拉取 -> packs.installZip(目标世界)
+async function handlePackImportUpload(p) {
+  const { uploadId, fileName, world, totalChunks, type } = p || {};
+  if (!uploadId || !totalChunks) throw new Error('缺少上传参数');
+  if (!world) throw new Error('缺少目标世界');
+  console.log(`[MC1life] 拉取包上传分片: ${uploadId} (${totalChunks} 片, world=${world}, type=${type || 'auto'})`);
+  const tmpFile = await pullUploadChunks(uploadId, totalChunks, fileName);
+  try {
+    const result = packs.installZip(world, tmpFile, type || null);
+    console.log(`[MC1life] 包安装完成: ${JSON.stringify(result.installed.map(x => x.name + '[' + x.type + ']'))}`);
+    await cleanupUploadChunks(uploadId);
+    return { ok: true, ...result };
+  } catch (e) {
+    const keep = `/opt/mc1life/uploads/inspect_${uploadId}${path.extname(tmpFile) || '.bin'}`;
+    try { fs.renameSync(tmpFile, keep); console.log(`[MC1life] 包安装失败, 已保留文件供诊断: ${keep}`); }
     catch { try { fs.unlinkSync(tmpFile); } catch {} }
     throw e;
   } finally {

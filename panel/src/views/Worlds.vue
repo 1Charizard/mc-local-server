@@ -15,6 +15,8 @@
             <td class="ops">
               <button v-if="isAdmin" class="mini ok" :disabled="w.isCurrent || !w.hasLevelDat" @click="doSwitch(w.name)">切换到此世界</button>
               <button v-if="isAdmin" class="mini" :disabled="!w.hasLevelDat" @click="doExport(w.name)">⬇️ 导出</button>
+              <button v-if="isAdmin" class="mini" :disabled="!w.hasLevelDat" @click="doRename(w.name)">✏️ 重命名</button>
+              <button v-if="isAdmin" class="mini" :disabled="!w.hasLevelDat" @click="goPacks(w.name)">🧩 包</button>
               <button v-if="isAdmin" class="mini danger" :disabled="w.isCurrent" @click="doDelete(w.name)">🗑️ 删除</button>
               <span v-if="!isAdmin" class="tip">只读</span>
             </td>
@@ -56,7 +58,7 @@
 
 <script setup>
 import { ref, onMounted } from 'vue';
-import { getWorlds, switchWorld, deleteWorld, uploadWorld, uploadWorldFile, exportWorld, downloadExport, getRole } from '../api';
+import { getWorlds, switchWorld, deleteWorld, renameWorld, uploadWorld, uploadWorldFile, exportWorld, downloadExport, getRole } from '../api';
 
 const worlds = ref([]);
 const url = ref('');
@@ -112,6 +114,21 @@ async function doSwitch(name) {
   if (!confirm(`确定切换到世界「${name}」吗？服务器将自动重启。`)) return;
   try { result.value = JSON.stringify(await switchWorld(name)); } catch (e) { result.value = `错误: ${e.message}`; }
   refresh();
+}
+async function doRename(name) {
+  const newName = prompt(`重命名世界「${name}」为新名称:`, name);
+  if (!newName || newName.trim() === name) return;
+  if (!confirm(`确定将世界「${name}」重命名为「${newName.trim()}」？\n\n若为当前世界，服务器会自动重启。`)) return;
+  try {
+    const r = await renameWorld(name, newName.trim());
+    result.value = (r.ok === false ? `重命名失败: ${r.error || '未知错误'}` : `✅ 已重命名为「${r.renamed}」${r.restarted ? '（当前世界已重启）' : ''}`);
+  } catch (e) { result.value = `错误: ${e.message}`; }
+  refresh();
+}
+function goPacks(name) {
+  // 目标世界名存 sessionStorage, 供 Packs 页默认选中
+  try { sessionStorage.setItem('mc1life_packs_world', name); } catch {}
+  location.href = '/packs';
 }
 async function doUpload() {
   try { result.value = JSON.stringify(await uploadWorld(url.value, name.value)); url.value = ''; name.value = ''; } catch (e) { result.value = `错误: ${e.message}`; }
