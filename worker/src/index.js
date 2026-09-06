@@ -60,8 +60,6 @@ function bytesToB64(bytes) {
   }
   return btoa(bin);
 }
-const CMD_KEY = 'agent:cmd:queue';
-const RESULT_PREFIX = 'agent:result:';
 const UPLOAD_KEY = 'agent:upload:';
 
 // Agent 在线判定: KV state 存在且 45 秒内更新过
@@ -74,24 +72,43 @@ async function agentOnline(env) {
   } catch { return false; }
 }
 
-/** 提交指令到队列, 等待 Agent 轮询执行并回传结果 (最多 30s) */
+/**
+ * 提交指令到队列, 等待 Agent 轮询执行并回传结果 (最多 30s)
+ * 队列与结果存 D1 (tasks 表): D1 复制延迟远小于 KV, 避免跨 POP 读不到 KV 导致指令"丢失"
+ */
 async function submitCmd(env, kind, payload, timeoutMs = 30000) {
   if (!(await agentOnline(env))) return { ok: false, error: 'Agent 当前离线, 请稍后重试' };
   const id = crypto.randomUUID();
-  // 入队
-  const q = JSON.parse((await env.SESSION_KV.get(CMD_KEY)) || '[]');
-  q.push({ id, kind, payload });
-  await env.SESSION_KV.put(CMD_KEY, JSON.stringify(q));
-  // 轮询结果
+  const payloadStr = JSON.stringify({ kind, payload });
+  // 入队 (D1 INSERT)
+  try {
+    await env.DB.prepare('INSERT INTO tasks (id, type, status, payload) VALUES (?, ?, ?, ?)')
+      .bind(id, 'cmd', 'pending', payloadStr).run();
+  } catch (e) {
+    return { ok: false, error: '指令入队失败: ' + e.message };
+  }
+  // 轮询结果 (D1 SELECT; 亚秒级复制, 30s 内必然可见)
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const r = await env.SESSION_KV.get(RESULT_PREFIX + id, 'json');
-    if (r) {
-      await env.SESSION_KV.delete(RESULT_PREFIX + id);
-      return { ok: r.ok, result: r.result, error: r.error };
+    const row = await env.DB.prepare('SELECT status, result FROM tasks WHERE id = ?')
+      .bind(id).first().catch(() => null);
+    if (row && row.status === 'done') {
+      let r = { ok: true };
+      try { r = JSON.parse(row.result || '{}'); } catch {}
+      await env.DB.prepare('DELETE FROM tasks WHERE id = ?').bind(id).run().catch(() => {});
+      return { ok: r.ok !== false, result: r.result, error: r.error };
     }
-    await new Promise(res => setTimeout(res, 1000));
+    if (row && row.status === 'failed') {
+      await env.DB.prepare('DELETE FROM tasks WHERE id = ?').bind(id).run().catch(() => {});
+      let r = {};
+      try { r = JSON.parse(row.result || '{}'); } catch {}
+      return { ok: false, error: r.error || '指令执行失败' };
+    }
+    await new Promise(res => setTimeout(res, 800));
   }
+  // 超时: 标记 failed, 由 Agent 侧兜底不重复处理
+  await env.DB.prepare("UPDATE tasks SET status = 'failed', finished_at = datetime('now') WHERE id = ? AND status = 'pending'")
+    .bind(id).run().catch(() => {});
   return { ok: false, error: 'Agent 响应超时' };
 }
 
@@ -153,25 +170,32 @@ app.post('/api/agent/heartbeat', async (c) => {
   return c.json({ ok: true, ts: state.ts });
 });
 
-// Agent 拉取指令
+// Agent 拉取指令 (D1 tasks 表: 单条原子出队, 不丢不重)
 app.get('/api/agent/poll', async (c) => {
   const agent = AUTH.checkAgent(c);
   if (!agent) return c.json({ ok: false, error: '未授权' }, 401);
-  const q = JSON.parse((await c.env.SESSION_KV.get(CMD_KEY)) || '[]');
-  if (!q.length) return c.json({ ok: true, cmds: [] });
-  // 取第一条并移除
-  const cmd = q.shift();
-  await c.env.SESSION_KV.put(CMD_KEY, JSON.stringify(q));
-  return c.json({ ok: true, cmds: [cmd] });
+  const row = await c.env.DB
+    .prepare("SELECT id, payload FROM tasks WHERE status = 'pending' ORDER BY created_at ASC, rowid ASC LIMIT 1")
+    .first().catch(() => null);
+  if (!row) return c.json({ ok: true, cmds: [] });
+  // 标记 running (防止 submitCmd 超时后另一 poll 重复取到)
+  await c.env.DB.prepare("UPDATE tasks SET status = 'running' WHERE id = ? AND status = 'pending'")
+    .bind(row.id).run().catch(() => {});
+  let payload = {};
+  try { payload = JSON.parse(row.payload || '{}'); } catch {}
+  return c.json({ ok: true, cmds: [{ id: row.id, ...payload }] });
 });
 
-// Agent 回传结果
+// Agent 回传结果 (D1 UPDATE; submitCmd 轮询 D1 亚秒级可见)
 app.post('/api/agent/result', async (c) => {
   const agent = AUTH.checkAgent(c);
   if (!agent) return c.json({ ok: false, error: '未授权' }, 401);
   const { id, ok, result, error } = await c.req.json().catch(() => ({}));
   if (!id) return c.json({ ok: false, error: '缺少 id' }, 400);
-  await c.env.SESSION_KV.put(RESULT_PREFIX + id, JSON.stringify({ ok, result, error, ts: Date.now() }), { expirationTtl: 120 });
+  await c.env.DB
+    .prepare("UPDATE tasks SET status = ?, result = ?, finished_at = datetime('now') WHERE id = ?")
+    .bind(ok ? 'done' : 'failed', JSON.stringify({ ok, result, error, ts: Date.now() }), id)
+    .run().catch(() => {});
   return c.json({ ok: true });
 });
 
@@ -428,10 +452,11 @@ app.post('/api/worlds/upload/finish', async (c) => {
   }
   if (!(await agentOnline(c.env))) return c.json({ ok: false, error: 'Agent 当前离线, 无法导入存档' }, 503);
   await logAudit(c.env, 'admin', 'world_upload', `${meta.fileName} (${(meta.size/1048576).toFixed(1)}MB, ${meta.totalChunks}片)`);
-  // 入队指令, 不等待结果 (Agent 后台导入, 面板轮询世界列表可见)
-  const q = JSON.parse((await c.env.SESSION_KV.get(CMD_KEY)) || '[]');
-  q.push({ id: crypto.randomUUID(), kind: 'worldImportUpload', payload: { uploadId, fileName: meta.fileName, worldName: meta.worldName || meta.fileName, totalChunks: meta.totalChunks } });
-  await c.env.SESSION_KV.put(CMD_KEY, JSON.stringify(q));
+  // 入队指令 (D1), 不等待结果 (Agent 后台导入, 面板轮询世界列表可见)
+  const tid = crypto.randomUUID();
+  const tpayload = JSON.stringify({ kind: 'worldImportUpload', payload: { uploadId, fileName: meta.fileName, worldName: meta.worldName || meta.fileName, totalChunks: meta.totalChunks } });
+  await c.env.DB.prepare('INSERT INTO tasks (id, type, status, payload) VALUES (?, ?, ?, ?)')
+    .bind(tid, 'cmd', 'pending', tpayload).run().catch(() => {});
   return c.json({ ok: true, pending: true, message: '已提交导入, Agent 后台处理中, 稍后刷新世界列表' });
 });
 

@@ -1,7 +1,7 @@
-// BDS 进程管理: 启停/重启/崩溃自愈/stdin 指令
+// BDS 进程管理: 启停/重启/崩溃自愈/stdin 指令 (console 通道)
+// 注意: BDS 1.21.90+ 移除了 RCON, 管理命令统一走进程 stdin/stdout 控制台
 const { EventEmitter } = require('events');
 const { spawn } = require('child_process');
-const readline = require('readline');
 const fs = require('fs');
 const path = require('path');
 
@@ -9,17 +9,20 @@ class BDS extends EventEmitter {
   constructor(cfg, { rcon }) {
     super();
     this.cfg = cfg;
-    this.rcon = rcon;
+    this.rcon = rcon; // 保留兼容 (RCON 不可用时走 console)
     this.proc = null;
     this.running = false;
     this.pid = null;
     this._logBuffer = [];       // 环形缓冲
-    this._maxLogLines = 2000;
+    this._maxLogLines = 3000;
     this._stdinQueue = Promise.resolve();
     this._crashCount = 0;
     this._version = '';
     this._lastCpu = 0; this._lastCpuTime = 0;
     this._restarting = false;
+    this._active = null;         // 当前活动命令 (exec 严格串行)
+    this._chain = Promise.resolve();
+    this._lineBuffer = '';
   }
 
   get logBuffer() { return this._logBuffer; }
@@ -33,13 +36,79 @@ class BDS extends EventEmitter {
     return this._version;
   }
 
+  /** 向 BDS 控制台发命令并等待响应 (解析 stdout, 静默期判定结束) */
+  // 真实 BDS (1.21.90+) 管道下不回显命令 → 写命令后收集输出行, 500ms 无新输出判定响应完成
+  // exec 严格串行: 心跳 collectPlayers 与 poll 指令可能并发, 必须排队避免响应串扰
+  exec(cmd, timeoutMs = 15000) {
+    const task = this._chain.then(() => this._execOne(cmd, timeoutMs));
+    this._chain = task.catch(() => {});
+    return task;
+  }
+
+  _execOne(cmd, timeoutMs) {
+    return new Promise((resolve, reject) => {
+      if (!this.proc || !this.proc.stdin) return reject(new Error('BDS 未运行'));
+      const waiter = {
+        cmd: cmd.trim(),
+        resp: [],
+        collecting: false,   // write 成功回调后置 true, 之后的 stdout 行才视为响应
+        resolve, reject,
+        idleTimer: null,     // 行间静默计时 (响应已开始)
+        firstLineTimer: null, // 首行等待: 3s 无任何输出视为"无输出命令"(say/kick/ban 成功时静默)
+        done: false,
+      };
+      this._active = waiter;
+      this._stdinQueue = this._stdinQueue.then(() => new Promise(res => {
+        try {
+          this.proc.stdin.write(waiter.cmd + '\n', () => {
+            waiter.collecting = true;
+            res();
+            // 3s 无任何输出 → 命令已被接受但无回显 (say/kick/ban/op 成功时控制台静默), 视为成功
+            waiter.firstLineTimer = setTimeout(() => {
+              if (!waiter.done) this._finishWaiter(waiter, true, waiter.resp.join('\n'), null);
+            }, 3000);
+          });
+        } catch { res(); }
+      })).catch(() => {});
+      // 总超时兜底
+      setTimeout(() => this._finishWaiter(waiter, false, null, `命令超时: ${cmd}`), timeoutMs);
+    });
+  }
+
+  /** 结束等待: 成功(resolve resp) 或 失败(reject err) */
+  _finishWaiter(waiter, ok, resp, err) {
+    if (waiter.done) return;
+    waiter.done = true;
+    if (waiter.idleTimer) clearTimeout(waiter.idleTimer);
+    if (waiter.firstLineTimer) clearTimeout(waiter.firstLineTimer);
+    if (this._active === waiter) this._active = null;
+    if (ok) waiter.resolve(resp);
+    else waiter.reject(new Error(err));
+  }
+
+  /** 从 stdout 行解析命令响应 (无回显依赖) */
+  _onStdoutLine(line) {
+    const stripped = line.trim();
+    if (!stripped) return;
+    const waiter = this._active;  // 只有一个活动命令 (exec 串行)
+    if (!waiter || !waiter.collecting) return;  // write 回调前到达的行忽略
+    if (waiter.firstLineTimer) { clearTimeout(waiter.firstLineTimer); waiter.firstLineTimer = null; }
+    // 命令响应与常规日志同带 [ts LEVEL] 前缀, 无法严格区分 → 收集, 靠静默期截断
+    waiter.resp.push(stripped);
+    if (waiter.idleTimer) clearTimeout(waiter.idleTimer);
+    waiter.idleTimer = setTimeout(() => {
+      this._finishWaiter(waiter, true, waiter.resp.join('\n'), null);
+    }, 500);
+  }
+
+
   async start() {
     if (this.proc) return;
     this._restarting = false;
     const script = this.cfg.runScript;
     if (!fs.existsSync(script)) throw new Error(`运行脚本不存在: ${script}`);
     this._log('info', '正在启动 BDS ...');
-    // run.sh 内部 cd 到 bds 目录
+    // run.sh 内部 cd 到 bds 目录; stdin/stdout 用管道 (console 控制台通道)
     this.proc = spawn('bash', [script], { cwd: this.cfg.dir, env: process.env });
     this.pid = this.proc.pid;
     this.running = true;
@@ -51,6 +120,8 @@ class BDS extends EventEmitter {
       this._log('warn', `BDS 进程退出 code=${code} signal=${signal}`);
       const crashed = this.running && !this._restarting;
       this.proc = null; this.pid = null; this.running = false;
+      // 清理活动命令
+      if (this._active && !this._active.done) this._finishWaiter(this._active, false, null, 'BDS 已退出');
       if (crashed) {
         this._crashCount++;
         this.emit('crash', `BDS 异常退出 (code=${code}), 5 秒后自动重启 (第 ${this._crashCount} 次)`);
@@ -63,12 +134,12 @@ class BDS extends EventEmitter {
     });
 
     // 等待启动完成 (检测 "Server started" 日志 或超时)
-    await this._waitStarted(this.cfg.startTimeoutMs || 90000);
+    await this._waitStarted(this.cfg.startTimeoutMs || 120000);
     this.emit('started');
   }
 
   _waitStarted(timeoutMs) {
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve) => {
       const t0 = Date.now();
       const timer = setInterval(() => {
         if (this._logBuffer.some(l => l.includes('Server started') || l.includes('IPv6 supported'))) {
@@ -84,12 +155,9 @@ class BDS extends EventEmitter {
     if (!this.proc) return;
     this._restarting = true;
     this._log('info', '正在停止 BDS ...');
-    try {
-      // 先广播, 再优雅停止
-      await this.rcon.exec('say §c服务器即将关闭...');
-      await this.rcon.exec('save hold');
-    } catch {}
-    try { await this.rcon.exec('stop'); } catch {}
+    // console 通道: save hold 后 stop
+    try { await this.exec('save hold', 8000).catch(() => {}); } catch {}
+    try { await this.exec('stop', 10000).catch(() => {}); } catch {}
     // 等待退出, 最长 30s
     const t0 = Date.now();
     while (this.proc && Date.now() - t0 < 30000) await new Promise(r => setTimeout(r, 200));
@@ -105,7 +173,7 @@ class BDS extends EventEmitter {
     await this.start();
   }
 
-  /** 向 BDS stdin 发送指令 (仅作为 RCON 兜底) */
+  /** 兼容: 直接发命令不等响应 (fire-and-forget) */
   sendStdin(cmd) {
     if (!this.proc || !this.proc.stdin) throw new Error('BDS 未运行');
     this._stdinQueue = this._stdinQueue.then(() => new Promise(res => {
@@ -114,8 +182,13 @@ class BDS extends EventEmitter {
   }
 
   _feed(text) {
-    for (const line of text.split(/\r?\n/)) {
-      if (!line) continue;
+    // 按行拆分 (兼容 \r\n)
+    this._lineBuffer += text;
+    const lines = this._lineBuffer.split(/\r?\n/);
+    this._lineBuffer = lines.pop();
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      this._onStdoutLine(line);
       this._logBuffer.push(line);
       if (this._logBuffer.length > this._maxLogLines) this._logBuffer.shift();
       this.emit('log', line);

@@ -23,8 +23,11 @@ const Worlds = require('./worlds');
 const Config = require('./config');
 const Hardcore = require('./hardcore');
 
-const rcon = new RCON(config.rcon);
-const bds = new BDS(config.bds, { rcon });
+const rconTCP = new RCON(config.rcon);
+const bds = new BDS(config.bds, { rcon: rconTCP });
+// BDS 1.21.90+ 已移除 RCON → 所有管理指令统一走 BDS console (stdin/stdout)
+// 保持 rcon.exec 接口不变, 内部转发到 bds.exec
+const rcon = { exec: (cmd, timeoutMs) => bds.exec(cmd, timeoutMs) };
 const backup = new Backup(config.bds, config.r2, config.backup, bds, rcon);
 const worlds = new Worlds(config.bds, bds);
 const cfg = new Config(config.bds);
