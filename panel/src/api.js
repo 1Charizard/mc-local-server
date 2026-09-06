@@ -129,7 +129,8 @@ export async function uploadWorldFile(file, name, onProgress) {
   // 3. finish (提交导入, 后台处理)
   const fin = await req('/api/worlds/upload/finish', { method: 'POST', body: JSON.stringify({ uploadId }) });
   if (onProgress) onProgress(100, totalChunks, totalChunks);
-  return fin;
+    // 附带 start 阶段的 worldName (供前端轮询判断新世界是否出现)
+    return { ...fin, worldName: st.worldName };
 }
 export const getHardcore = () => req('/api/hardcore');
 export const setHardcore = (enabled, mode) => req('/api/hardcore', { method: 'POST', body: JSON.stringify({ enabled, mode }) });

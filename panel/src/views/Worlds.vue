@@ -138,7 +138,7 @@ async function doUploadFile() {
     const inp = document.querySelector('input[type=file]');
     if (inp) inp.value = '';
     // 轮询世界列表: 导入需要 1-2 分钟, 每 3s 刷一次直到新世界出现 (最多 60s)
-    const wantName = st.worldName || '';
+    const wantName = (r && r.worldName) || '';
     for (let i = 0; i < 20; i++) {
       await new Promise(res => setTimeout(res, 3000));
       try {

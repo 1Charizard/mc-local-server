@@ -2,7 +2,8 @@
 // 统一入口: 面板静态资源 + API/WS 代理到后端 Worker (mc1life-api.mc1life.workers.dev)
 // + /dl 下载代理 (BDS zip, 经 CF 边缘访问 minecraft.net, 国内可达)
 // 这样国内浏览器只需访问 pages.dev (可达), 后端通信由 Cloudflare 边缘完成
-const API_ORIGIN = env?.API_ORIGIN || 'https://YOUR_WORKER.workers.dev';
+// API_ORIGIN 在 fetch() 内读取: Pages 环境变量注入, 无则用占位符 (部署时替换为真实 Worker 域名)
+const FALLBACK_API = 'https://YOUR_WORKER.workers.dev';
 // 面板 token (与 Worker 的 PANEL_AUTH_TOKEN 一致, 通过 Pages 环境变量注入)
 const PANEL_TOKEN = env => env?.PANEL_AUTH_TOKEN || '';
 
@@ -18,6 +19,7 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;
+    const API_ORIGIN = env?.API_ORIGIN || FALLBACK_API;
 
     // ---- 下载代理: /dl?url=<https://www.minecraft.net/...> ----
     if (path === '/dl') {
