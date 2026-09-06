@@ -110,11 +110,16 @@ class Worlds {
   /** 核心: 解压/校验/移动为世界目录 */
   // 支持"整个世界文件夹打包 zip": 解压后遍历整树定位 level.dat 所在目录(世界根),
   // 无视 __MACOSX/.DS_Store/多级嵌套等夹带内容; 世界名智能回退 levelname.txt
+  /** 核心: 解压/校验/移动为世界目录 */
+  // 支持"整个世界文件夹打包 zip": 解压后遍历整树定位 level.dat 所在目录(世界根),
+  // 无视 __MACOSX/.DS_Store/多级嵌套等夹带内容; 世界名智能回退 levelname.txt
   async _importFromFile(tmpFile, name) {
     const ext = tmpFile.match(/\.(zip|tar\.gz|tgz|mcworld)$/i)?.[1] || 'zip';
-    // 1) 解压到临时 staging
-    const staging = `/tmp/mc1life_stage_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+    // 1) 解压到临时 staging (放 worldDir 内 = 同文件系统, 避免跨设备 rename EXDEV)
+    fs.mkdirSync(this.worldDir, { recursive: true });
+    const staging = path.join(this.worldDir, `.staging_${Date.now()}_${Math.floor(Math.random() * 1e6)}`);
     fs.mkdirSync(staging, { recursive: true });
+    let target = null;   // 记录已建目标目录, 失败时清理
     try {
       if (ext === 'zip' || ext === 'mcworld') {
         this._extractZip(tmpFile, staging);   // node 内置解压, 防 zip-slip
@@ -129,9 +134,9 @@ class Worlds {
       const worldRoot = hits[0].dir;
       if (hits.length > 1) console.log(`[MC1life] 存档内含多个 level.dat (${hits.length} 个), 取最浅: ${path.relative(staging, worldRoot)}`);
       // 3) 确定世界名
-      let baseName = this._pickWorldName(staging, worldRoot, name);
+      const baseName = this._pickWorldName(staging, worldRoot, name);
       let targetName = baseName;
-      let target = path.join(this.worldDir, targetName);
+      target = path.join(this.worldDir, targetName);
       let n = 2;
       while (fs.existsSync(target)) {
         targetName = `${baseName}_${n}`;
@@ -142,7 +147,16 @@ class Worlds {
       fs.mkdirSync(target, { recursive: true });
       for (const f of fs.readdirSync(worldRoot)) {
         if (f === '__MACOSX' || f === '.DS_Store' || f.startsWith('._')) continue;
-        fs.renameSync(path.join(worldRoot, f), path.join(target, f));
+        const src = path.join(worldRoot, f);
+        try {
+          fs.renameSync(src, path.join(target, f));  // 同文件系统, 正常成功
+        } catch (e) {
+          if (e.code === 'EXDEV') {
+            // 兜底: 万一仍跨设备, 复制+删除 (慢但可靠)
+            fs.cpSync(src, path.join(target, f), { recursive: true });
+            fs.rmSync(src, { recursive: true, force: true });
+          } else throw e;
+        }
       }
       if (!fs.existsSync(path.join(target, 'level.dat'))) {
         fs.rmSync(target, { recursive: true, force: true });
@@ -150,10 +164,16 @@ class Worlds {
       }
       console.log(`[MC1life] 世界导入成功: ${path.basename(target)} (内容来自 ${path.relative(staging, worldRoot) || 'zip 根'})`);
       return { world: path.basename(target), ok: true };
+    } catch (e) {
+      // 失败时清理已建的目标目录 (避免残留空目录/半成品)
+      if (target && fs.existsSync(target)) fs.rmSync(target, { recursive: true, force: true });
+      throw e;
     } finally {
       fs.rmSync(staging, { recursive: true, force: true });
     }
   }
+
+
 
   /** 内置 zip 解压 (zlib + central directory; 免系统 unzip; 防 zip-slip 路径穿越) */
   _extractZip(zipFile, destDir) {
