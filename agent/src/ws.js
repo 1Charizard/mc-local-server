@@ -92,7 +92,7 @@ class PollClient {
     this._polling = true;
     try {
       const r = await this._req('GET', '/poll', null, 15000);
-      console.log('[MC1life] poll resp:', JSON.stringify(r).slice(0, 200));
+      if (r && r.ok && Array.isArray(r.cmds) && r.cmds.length) console.log('[MC1life] poll 拿到指令:', r.cmds.length, '条');
       if (r && r.ok && Array.isArray(r.cmds)) {
         for (const cmd of r.cmds) {
           console.log('[MC1life] 执行指令:', cmd.kind, JSON.stringify(cmd.payload || {}).slice(0, 150));
