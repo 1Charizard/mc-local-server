@@ -56,6 +56,14 @@ export const sendCmd = (command) => req('/api/cmd', { method: 'POST', body: JSON
 export const serverAction = (action) => req(`/api/server/${action}`, { method: 'POST' });
 export const getPlayers = () => req('/api/players');
 export const playerAction = (action, payload) => req(`/api/players/${action}`, { method: 'POST', body: JSON.stringify(payload) });
+// 封禁体系: ban/unban/bans(列表)/bans/time(改时间) — until=null 永久, 数值=到期时间戳(ms)
+export const banPlayer = (name, reason, until) => req('/api/players/ban', { method: 'POST', body: JSON.stringify({ name, reason: reason || '', until: until === undefined ? null : until }) });
+export const unbanPlayer = (nameOrXuid) => req('/api/players/unban', { method: 'POST', body: JSON.stringify({ nameOrXuid }) });
+export const getBans = async () => {
+  const r = await req('/api/players/bans');
+  return r.result || [];
+};
+export const setBanTime = (nameOrXuid, until) => req('/api/players/bans/time', { method: 'POST', body: JSON.stringify({ nameOrXuid, until: until === undefined ? null : until }) });
 export const getBackups = () => req('/api/backups');
 export const createBackup = (name) => req('/api/backups', { method: 'POST', body: JSON.stringify({ name }) });
 export const restoreBackup = (backupId) => req('/api/backups/restore', { method: 'POST', body: JSON.stringify({ backupId }) });
@@ -177,11 +185,22 @@ export async function uploadChunked(startPath, finishPath, file, meta, onProgres
   return { ...fin, worldName: meta.worldName || st.worldName || '' };
 }
 export const renameWorld = (oldName, newName) => req('/api/worlds/rename', { method: 'POST', body: JSON.stringify({ oldName, newName }) });
-export const getWorldPacks = (world) => req(`/api/worlds/packs?world=${encodeURIComponent(world)}`);
+export const getWorldPacks = async (world) => {
+  const r = await req(`/api/worlds/packs?world=${encodeURIComponent(world)}`);
+  return r.result || r || {};
+};
 export const toggleWorldPack = (world, uuid, enabled) => req('/api/worlds/packs/toggle', { method: 'POST', body: JSON.stringify({ world, uuid, enabled }) });
 export const deleteWorldPack = (world, uuid) => req('/api/worlds/packs/delete', { method: 'POST', body: JSON.stringify({ world, uuid }) });
 export const uploadPackFile = (world, type, file, onProgress) =>
   uploadChunked('/api/packs/upload/start', '/api/packs/upload/finish', file, { world, type: type || '' }, onProgress);
+// 组件库 (全局行为/材质包): 上传时 world 传空串 -> 库; 各世界可单独启停
+export const getPackLibrary = async () => {
+  const r = await req('/api/packs/library');
+  return r.result || r || { behavior: [], resource: [] };
+};
+export const deleteLibraryPack = (uuid) => req('/api/packs/library/delete', { method: 'POST', body: JSON.stringify({ uuid }) });
+export const uploadPackToLibrary = (type, file, onProgress) =>
+  uploadChunked('/api/packs/upload/start', '/api/packs/upload/finish', file, { world: '', type: type || '' }, onProgress);
 export const getHardcore = () => req('/api/hardcore');
 export const setHardcore = (enabled, mode) => req('/api/hardcore', { method: 'POST', body: JSON.stringify({ enabled, mode }) });
 export const getConfig = (file) => req(`/api/config?file=${encodeURIComponent(file || 'server.properties')}`);

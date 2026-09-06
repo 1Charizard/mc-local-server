@@ -22,6 +22,7 @@ const Backup = require('./backup');
 const Worlds = require('./worlds');
 const Config = require('./config');
 const Hardcore = require('./hardcore');
+const Moderation = require('./moderation');
 
 const rconTCP = new RCON(config.rcon);
 const bds = new BDS(config.bds, { rcon: rconTCP });
@@ -35,6 +36,7 @@ const packs = new Packs(config.bds, bds);
 const cfg = new Config(config.bds);
 const hardcore = new Hardcore(config.hardcore, { bds, rcon, backup, send });
 hardcore.start();
+const moderation = new Moderation(config.bds, bds, rcon).init();
 
 // 状态缓存
 const state = {
@@ -92,6 +94,26 @@ function send(type, data) {
   return true;
 }
 
+// OP 授予/撤销 + 游戏内通知 (tellraw, 在线玩家可见; 理由一并告知)
+async function handleOp(grant, p) {
+  const name = String(p.name || '').trim();
+  if (!name) throw new Error('缺少玩家名');
+  const cmd = grant ? 'op' : 'deop';
+  const out = await rcon.exec(`${cmd} "${name}"`, 10000);
+  const reasonText = String(p.reason || '').slice(0, 100);
+  const ok = !/no targets|unknown|error|not found/i.test(String(out));
+  if (ok) {
+    const actionText = grant ? '你已被授予管理员 (OP) 权限' : '你的管理员 (OP) 权限已被撤销';
+    const msg = `[MC1life] ${actionText}${reasonText ? ' — ' + reasonText : ''}`;
+    try {
+      const json = JSON.stringify({ rawtext: [{ text: msg }] });
+      await rcon.exec(`tellraw "${name}" ${json}`, 8000).catch(() => {});
+    } catch {}
+    console.log(`[MC1life] ${grant ? '授予 OP' : '撤销 OP'}: ${name}${reasonText ? ' (' + reasonText + ')' : ''} [已游戏内通知]`);
+  }
+  return { ok: ok !== false, output: String(out).slice(0, 300), notified: ok };
+}
+
 // ---------- 指令分发 ----------
 async function dispatch(kind, p) {
   switch (kind) {
@@ -102,11 +124,13 @@ async function dispatch(kind, p) {
     case 'stop': await bds.stop(); return collectStatus();
     case 'restart': await bds.restart(); return collectStatus();
     case 'exec': return await rcon.exec(p.command);
-    case 'kick': return await rcon.exec(`kick "${p.name}" ${p.reason || ''}`.trim());
-    case 'ban': return await rcon.exec(`ban "${p.name}" ${p.reason || ''}`.trim());
-    case 'unban': return await rcon.exec(`unban "${p.name}"`.trim());
-    case 'op': return await rcon.exec(`op "${p.name}"`.trim());
-    case 'deop': return await rcon.exec(`deop "${p.name}"`.trim());
+    case 'kick': return await moderation.kick(p.name, p.reason);
+    case 'ban': return await moderation.ban(p.name, { reason: p.reason, until: p.until });
+    case 'unban': return moderation.unban(p.name || p.nameOrXuid);
+    case 'op': return await handleOp(true, p);
+    case 'deop': return await handleOp(false, p);
+    case 'banList': return { ok: true, bans: moderation.list() };
+    case 'setBanTime': return moderation.setTime(p.nameOrXuid || p.name, p.until);
     case 'say': return await rcon.exec(`say ${p.message || ''}`);
     case 'list': return await rcon.exec('list');
     case 'listBackups': return await backup.list();
@@ -142,6 +166,8 @@ async function dispatch(kind, p) {
     case 'listWorldPacks': return packs.list(p.world);
     case 'worldPackToggle': return packs.toggle(p.world, p.uuid, !!p.enabled);
     case 'worldPackDelete': return packs.remove(p.world, p.uuid);
+    case 'listPackLibrary': return packs.library();
+    case 'packLibraryDelete': return packs.removeLibrary(p.uuid);
     case 'packImportUpload': return handlePackImportUpload(p);
     case 'getConfig': return await cfg.getAll(p.file || 'server.properties');
     case 'setConfig': return await cfg.set(p.file || 'server.properties', p.key, p.value, { restart: !!p.restart });
@@ -296,15 +322,17 @@ async function handleWorldImportUpload(p) {
   }
 }
 
-// 行为/材质包上传: 分片拉取 -> packs.installZip(目标世界)
+// 行为/材质包上传: 分片拉取 -> 指定世界 packs.installZip / 组件库 packs.installToLibrary
 async function handlePackImportUpload(p) {
   const { uploadId, fileName, world, totalChunks, type } = p || {};
   if (!uploadId || !totalChunks) throw new Error('缺少上传参数');
-  if (!world) throw new Error('缺少目标世界');
-  console.log(`[MC1life] 拉取包上传分片: ${uploadId} (${totalChunks} 片, world=${world}, type=${type || 'auto'})`);
+  const target = world ? `world=${world}` : '全局组件库';
+  console.log(`[MC1life] 拉取包上传分片: ${uploadId} (${totalChunks} 片, ${target}, type=${type || 'auto'})`);
   const tmpFile = await pullUploadChunks(uploadId, totalChunks, fileName);
   try {
-    const result = packs.installZip(world, tmpFile, type || null);
+    let result;
+    if (world) result = packs.installZip(world, tmpFile, type || null);
+    else result = packs.installToLibrary(tmpFile, type || null);
     console.log(`[MC1life] 包安装完成: ${JSON.stringify(result.installed.map(x => x.name + '[' + x.type + ']'))}`);
     await cleanupUploadChunks(uploadId);
     return { ok: true, ...result };

@@ -343,9 +343,9 @@ app.get('/api/players', async (c) => {
   return c.json({ result: state.players || [] });
 });
 
+// 玩家操作: kick/op/deop 走 console 命令; ban/unban 走封禁体系 (moderation)
 const playerActions = {
-  '/api/players/kick': 'kick', '/api/players/ban': 'ban', '/api/players/unban': 'unban',
-  '/api/players/op': 'op', '/api/players/deop': 'deop',
+  '/api/players/kick': 'kick', '/api/players/op': 'op', '/api/players/deop': 'deop',
 };
 for (const [route, kind] of Object.entries(playerActions)) {
   app.post(route, async (c) => {
@@ -355,6 +355,35 @@ for (const [route, kind] of Object.entries(playerActions)) {
     return c.json(r);
   });
 }
+// 封禁 (永久 until=null / 限时 until=时间戳) + 解封 + 封禁列表 + 改时间
+app.post('/api/players/ban', async (c) => {
+  const { name, reason, until } = await c.req.json();
+  if (!name) return c.json({ ok: false, error: '缺少玩家名' }, 400);
+  await logAudit(c.env, 'admin', 'player_ban', `${name}${until ? ' until=' + until : ' 永久'}`);
+  const r = await submitCmd(c.env, 'ban', { name, reason, until: until === undefined ? null : until }, 20000);
+  return c.json(r);
+});
+app.post('/api/players/unban', async (c) => {
+  const { nameOrXuid, name } = await c.req.json();
+  const key = nameOrXuid || name;
+  if (!key) return c.json({ ok: false, error: '缺少玩家标识' }, 400);
+  await logAudit(c.env, 'admin', 'player_unban', String(key));
+  const r = await submitCmd(c.env, 'unban', { nameOrXuid: key }, 20000);
+  return c.json(r);
+});
+app.get('/api/players/bans', async (c) => {
+  const r = await submitCmd(c.env, 'banList', {}, 20000);
+  if (!r.ok) return c.json(r);
+  return c.json({ result: r.result.bans || [] });
+});
+app.post('/api/players/bans/time', async (c) => {
+  const { nameOrXuid, name, until } = await c.req.json();
+  const key = nameOrXuid || name;
+  if (!key) return c.json({ ok: false, error: '缺少玩家标识' }, 400);
+  await logAudit(c.env, 'admin', 'player_bantime', `${key} until=${until === undefined ? '永久' : until}`);
+  const r = await submitCmd(c.env, 'setBanTime', { nameOrXuid: key, until: until === undefined ? null : until }, 20000);
+  return c.json(r);
+});
 
 app.get('/api/backups', async (c) => {
   const r = await submitCmd(c.env, 'listBackups', {});
@@ -405,6 +434,8 @@ app.post('/api/worlds/export', async (c) => {
   if (!name) return c.json({ ok: false, error: '缺少世界名' });
   await logAudit(c.env, 'admin', 'world_export', name);
   const r = await submitCmd(c.env, 'worldExport', { name }, 300000);
+  // 平铺 result (submitCmd 包成 {ok,result}, 前端需顶层 exportId/fileName)
+  if (r.ok && r.result && typeof r.result === 'object') return c.json({ ok: true, ...r.result });
   return c.json(r);
 });
 // 导出下载: 分片端点 (前端循环拉 base64 拼接, 绕开 Worker CPU 限制; R2 暂存)
@@ -539,10 +570,10 @@ app.post('/api/worlds/packs/delete', async (c) => {
   const r = await submitCmd(c.env, 'worldPackDelete', { world, uuid }, 30000);
   return c.json(r);
 });
-// 包分片上传: start (带 world + type 可选) -> 复用 /api/worlds/upload/chunk -> finish
+// 包上传: start (world 留空=上传到全局组件库; type 可选) -> 复用 /api/worlds/upload/chunk -> finish
 app.post('/api/packs/upload/start', async (c) => {
   const { fileName, size, world, type } = await c.req.json().catch(() => ({}));
-  if (!fileName || !size || !world) return c.json({ ok: false, error: '缺少参数 (fileName/size/world)' }, 400);
+  if (!fileName || !size) return c.json({ ok: false, error: '缺少参数 (fileName/size)' }, 400);
   if (size > MAX_UPLOAD) return c.json({ ok: false, error: `文件过大 (${(size/1048576).toFixed(1)}MB), 上限 500MB` }, 400);
   if (size <= 0) return c.json({ ok: false, error: '文件为空' }, 400);
   if (type && !['behavior', 'resource'].includes(type)) return c.json({ ok: false, error: 'type 仅支持 behavior/resource' }, 400);
@@ -567,12 +598,25 @@ app.post('/api/packs/upload/finish', async (c) => {
     if (o === null) return c.json({ ok: false, error: `分片缺失 (${i}/${meta.totalChunks})` }, 500);
   }
   if (!(await agentOnline(c.env))) return c.json({ ok: false, error: 'Agent 当前离线, 无法导入包' }, 503);
-  await logAudit(c.env, 'admin', 'pack_upload', `${meta.world} ${meta.fileName} (${(meta.size/1048576).toFixed(1)}MB)`);
+  await logAudit(c.env, 'admin', 'pack_upload', `${meta.world ? meta.world + ' ' : '(库) '}${meta.fileName} (${(meta.size/1048576).toFixed(1)}MB)`);
   const tid = crypto.randomUUID();
-  const tpayload = JSON.stringify({ kind: 'packImportUpload', payload: { uploadId, fileName: meta.fileName, world: meta.world, type: meta.type, totalChunks: meta.totalChunks } });
+  const tpayload = JSON.stringify({ kind: 'packImportUpload', payload: { uploadId, fileName: meta.fileName, world: meta.world || '', type: meta.type, totalChunks: meta.totalChunks } });
   await c.env.DB.prepare('INSERT INTO tasks (id, type, status, payload) VALUES (?, ?, ?, ?)')
     .bind(tid, 'cmd', 'pending', tpayload).run().catch(() => {});
   return c.json({ ok: true, pending: true, message: '已提交包安装, Agent 后台处理中' });
+});
+
+// ---- 全局组件库 (所有已上传包, 各世界可单独勾选) ----
+app.get('/api/packs/library', async (c) => {
+  const r = await submitCmd(c.env, 'listPackLibrary', {}, 30000);
+  return c.json(r);
+});
+app.post('/api/packs/library/delete', async (c) => {
+  const { uuid } = await c.req.json().catch(() => ({}));
+  if (!uuid) return c.json({ ok: false, error: '缺少 uuid' }, 400);
+  await logAudit(c.env, 'admin', 'pack_library_delete', String(uuid));
+  const r = await submitCmd(c.env, 'packLibraryDelete', { uuid }, 30000);
+  return c.json(r);
 });
 
 // 硬核模式配置

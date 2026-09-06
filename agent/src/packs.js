@@ -1,13 +1,15 @@
-// 世界行为包/材质包管理: 列表/启停/删除/从 zip 安装 (按世界隔离)
-// 机制: 包文件放 <世界>/behavior_packs/<包>/ 与 <世界>/resource_packs/<包>/
-//       激活状态由 <世界>/world_behavior_packs.json / world_resource_packs.json 记录 [{pack_id, version}]
+// 世界行为包/材质包管理 + 全局组件库
+// 世界包: 包文件放 <世界>/behavior_packs/<包>/ 与 <世界>/resource_packs/<包>/,
+//         激活状态由 <世界>/world_behavior_packs.json / world_resource_packs.json 记录 [{pack_id, version}]
+// 全局库: 包放 BDS 根 behavior_packs/ resource_packs/ (排除 vanilla/chemistry/editor 系统包),
+//         各世界 json 引用 uuid 即可启用 (BDS 加载时从世界目录或根目录找包)
 const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
 
 class Packs {
   constructor(bdsCfg, bds) {
-    this.cfg = bdsCfg;
+    this.cfg = bdsCfg;               // { dir: /opt/mc1life/bds, worldDir }
     this.bds = bds;
     this.worldDir = bdsCfg.worldDir || path.join(bdsCfg.dir, 'worlds');
   }
@@ -93,45 +95,40 @@ class Packs {
     } catch { return null; }
   }
 
-  // ---------- 核心 API ----------
+  /** 系统内置包 (不出现在列表: BDS 自带 vanilla/chemistry/education 及历史版本前缀) */
+  isSystemPack(folder) {
+    const f = String(folder || '');
+    return f === 'vanilla' || f === 'chemistry' || f === 'editor' || f === 'education' ||
+      f.startsWith('vanilla_') || f.startsWith('chemistry_') || f.startsWith('education_') || f.startsWith('experimental_');
+  }
 
-  /** 列出某世界的包: { behavior:[], resource:[] } (含启用状态) */
-  list(world) {
-    const root = this._worldRoot(world);
-    const out = { world, behavior: [], resource: [] };
-    // 读取当前激活 json (可能不存在 -> 空)
-    const activeBehavior = new Set(this._readJsonArray(path.join(root, 'world_behavior_packs.json')).map(x => x.pack_id));
-    const activeResource = new Set(this._readJsonArray(path.join(root, 'world_resource_packs.json')).map(x => x.pack_id));
-
-    const scan = (relDir, type, list, activeSet) => {
-      const dir = path.join(root, relDir);
-      if (!fs.existsSync(dir)) return;
-      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-        if (!entry.isDirectory()) continue;
-        const pdir = path.join(dir, entry.name);
-        const mf = this._readManifest(pdir);
-        const name = mf ? this._localizedName(pdir, mf.headerName || entry.name) : entry.name;
-        const uuid = mf ? mf.uuid : '';
-        const version = mf ? mf.version : [1, 0, 0];
-        list.push({
-          uuid,
-          folder: entry.name,
-          name,
-          version: Array.isArray(version) ? version.join('.') : String(version),
-          type,
-          size: this._dirSizeSync(pdir),
-          enabled: uuid ? activeSet.has(uuid) : activeSet.has(entry.name),
-          hasManifest: !!mf,
-        });
-      }
-    };
-
-    scan('behavior_packs', 'behavior', out.behavior, activeBehavior);
-    scan('resource_packs', 'resource', out.resource, activeResource);
+  /** 扫 root/rel 目录下的包 */
+  _scanDir(root, rel, type, activeSet, source) {
+    const out = [];
+    const dir = path.join(root, rel);
+    if (!fs.existsSync(dir)) return out;
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      if (this.isSystemPack(entry.name)) continue;
+      const pdir = path.join(dir, entry.name);
+      const mf = this._readManifest(pdir);
+      const uuid = mf ? mf.uuid : '';
+      out.push({
+        uuid,
+        folder: entry.name,
+        name: mf ? this._localizedName(pdir, mf.headerName || entry.name) : entry.name,
+        version: Array.isArray(mf?.version) ? mf.version.join('.') : '1.0.0',
+        type,
+        size: this._dirSizeSync(pdir),
+        enabled: uuid ? activeSet.has(uuid) : activeSet.has(entry.name),
+        hasManifest: !!mf,
+        source,
+      });
+    }
     return out;
   }
 
-  /** 按 uuid 或文件夹名找到包 (遍历两类) */
+  /** 按 uuid 或文件夹名在世界目录内找包 */
   _findPack(root, uuid) {
     for (const rel of ['behavior_packs', 'resource_packs']) {
       const dir = path.join(root, rel);
@@ -149,10 +146,95 @@ class Packs {
     return null;
   }
 
-  /** 启用/停用某世界的包 (改 world_*_packs.json) */
+  /** 按 uuid 找包: 世界内优先, 其次全局库 */
+  _findPackAnywhere(world, uuid) {
+    if (world) {
+      try {
+        const root = this._worldRoot(world);
+        const f = this._findPack(root, uuid);
+        if (f) return { ...f, source: 'world' };
+      } catch {}
+    }
+    for (const rel of ['behavior_packs', 'resource_packs']) {
+      const dir = path.join(this.cfg.dir, rel);
+      if (!fs.existsSync(dir)) continue;
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        if (!entry.isDirectory() || this.isSystemPack(entry.name)) continue;
+        const pdir = path.join(dir, entry.name);
+        const mf = this._readManifest(pdir);
+        if (mf && mf.uuid === uuid) {
+          return { type: rel === 'behavior_packs' ? 'behavior' : 'resource', folder: entry.name, dir: pdir, mf, source: 'library' };
+        }
+      }
+    }
+    return null;
+  }
+
+  _readActiveRefs(worldDir) {
+    const out = [];
+    for (const [rel, type] of [['world_behavior_packs.json', 'behavior'], ['world_resource_packs.json', 'resource']]) {
+      for (const x of this._readJsonArray(path.join(worldDir, rel))) {
+        out.push({ pack_id: x.pack_id, type, version: x.version });
+      }
+    }
+    return out;
+  }
+
+  _listWorldDirs() {
+    if (!fs.existsSync(this.worldDir)) return [];
+    return fs.readdirSync(this.worldDir, { withFileTypes: true })
+      .filter(e => e.isDirectory() && !e.name.startsWith('.') && fs.existsSync(path.join(this.worldDir, e.name, 'level.dat')))
+      .map(e => e.name);
+  }
+
+  // ---------- 核心 API ----------
+
+  /** 列出某世界的全部可用包 = 世界本地包 + 全局库包 (同 uuid 本地优先) */
+  list(world) {
+    const root = this._worldRoot(world);
+    const activeBehavior = new Set(this._readJsonArray(path.join(root, 'world_behavior_packs.json')).map(x => x.pack_id));
+    const activeResource = new Set(this._readJsonArray(path.join(root, 'world_resource_packs.json')).map(x => x.pack_id));
+    const out = { world, behavior: [], resource: [] };
+    const localB = this._scanDir(root, 'behavior_packs', 'behavior', activeBehavior, 'world');
+    const localR = this._scanDir(root, 'resource_packs', 'resource', activeResource, 'world');
+    const seen = new Set();
+    for (const p of localB) { out.behavior.push(p); if (p.uuid) seen.add(p.uuid); }
+    for (const p of localR) { out.resource.push(p); if (p.uuid) seen.add(p.uuid); }
+    for (const p of this._scanDir(this.cfg.dir, 'behavior_packs', 'behavior', activeBehavior, 'library')) {
+      if (!seen.has(p.uuid)) { out.behavior.push(p); seen.add(p.uuid); }
+    }
+    for (const p of this._scanDir(this.cfg.dir, 'resource_packs', 'resource', activeResource, 'library')) {
+      if (!seen.has(p.uuid)) { out.resource.push(p); seen.add(p.uuid); }
+    }
+    return out;
+  }
+
+  /** 全局组件库: 根目录所有非系统包 + 被哪些世界引用 */
+  library() {
+    const out = { behavior: [], resource: [] };
+    const refs = {};
+    for (const wname of this._listWorldDirs()) {
+      for (const ref of this._readActiveRefs(path.join(this.worldDir, wname))) {
+        if (!refs[ref.pack_id]) refs[ref.pack_id] = [];
+        if (!refs[ref.pack_id].includes(wname)) refs[ref.pack_id].push(wname);
+      }
+    }
+    const scanLib = (rel, type, list) => {
+      for (const p of this._scanDir(this.cfg.dir, rel, type, new Set(), 'library')) {
+        p.refWorlds = refs[p.uuid] || [];
+        p.refCount = p.refWorlds.length;
+        list.push(p);
+      }
+    };
+    scanLib('behavior_packs', 'behavior', out.behavior);
+    scanLib('resource_packs', 'resource', out.resource);
+    return out;
+  }
+
+  /** 启用/停用某世界的包 (改 world_*_packs.json; 包可在世界内或全局库) */
   toggle(world, uuid, enabled) {
     const root = this._worldRoot(world);
-    const found = this._findPack(root, uuid);
+    const found = this._findPackAnywhere(world, uuid);
     if (!found) throw new Error(`未找到该包 (uuid=${uuid})`);
     const type = found.type;
     const relFile = type === 'behavior' ? 'world_behavior_packs.json' : 'world_resource_packs.json';
@@ -161,78 +243,31 @@ class Packs {
     const version = found.mf ? found.mf.version : [1, 0, 0];
 
     if (enabled) {
-      if (!arr.some(x => x.pack_id === found.mf?.uuid)) {
-        arr.push({ pack_id: found.mf?.uuid || found.folder, version });
+      if (!arr.some(x => x.pack_id === uuid)) {
+        arr.push({ pack_id: uuid, version });
         this._writeJsonArray(file, arr);
       }
-      return { ok: true, world, type, folder: found.folder, enabled: true, note: '包已启用, 重启世界后生效' };
+      return { ok: true, world, type, folder: found.folder, source: found.source, enabled: true, note: '包已启用, 重启世界后生效' };
     }
-    const filtered = arr.filter(x => x.pack_id !== found.mf?.uuid && x.pack_id !== found.folder);
+    const filtered = arr.filter(x => x.pack_id !== uuid);
     if (filtered.length !== arr.length) {
       this._writeJsonArray(file, filtered);
     }
-    return { ok: true, world, type, folder: found.folder, enabled: false, note: '包已停用, 重启世界后生效' };
+    return { ok: true, world, type, folder: found.folder, source: found.source, enabled: false, note: '包已停用, 重启世界后生效' };
   }
 
-  /** 删除包 (停用 + 删目录) */
+  /** 删除世界内包 (停用 + 删世界内目录) */
   remove(world, uuid) {
     const root = this._worldRoot(world);
     const found = this._findPack(root, uuid);
-    if (!found) throw new Error(`未找到该包 (uuid=${uuid})`);
-    // 先停用
+    if (!found) throw new Error(`世界内未找到该包 (uuid=${uuid}), 库包请从组件库删除`);
     this.toggle(world, uuid, false);
     fs.rmSync(found.dir, { recursive: true, force: true });
     return { ok: true, world, folder: found.folder, deleted: true };
   }
 
-  /** 从已解压 staging 中识别包 (含 staging 根自身 + 收集含 manifest.json 的目录, 排除父链也有 manifest 的嵌套) */
-  _discoverPacks(staging) {
-    const hits = [];
-    // staging 根自身就是包 (zip 根 = manifest.json)
-    if (fs.existsSync(path.join(staging, 'manifest.json'))) {
-      hits.push(staging);
-      return hits;
-    }
-    const walk = (dir) => {
-      let entries;
-      try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
-      for (const e of entries) {
-        if (e.name === '__MACOSX' || e.name === '.DS_Store' || e.name.startsWith('._')) continue;
-        const full = path.join(dir, e.name);
-        if (!e.isDirectory()) continue;
-        if (fs.existsSync(path.join(full, 'manifest.json'))) {
-          hits.push(full);
-          continue; // 不再深入 (manifest 包内部不再嵌套包)
-        }
-        // 若含 level.dat 说明是整个世界, 跳过 (避免把世界当包)
-        if (fs.existsSync(path.join(full, 'level.dat'))) continue;
-        walk(full);
-      }
-    };
-    walk(staging);
-    return hits;
-  }
-
-  /** 判断包类型: 指定 > manifest modules > 路径 > 特征; 返回 'behavior'|'resource' */
-  _detectType(packDir, forced, staging) {
-    if (forced === 'behavior' || forced === 'resource') return forced;
-    const mf = this._readManifest(packDir);
-    if (mf && mf.moduleTypes.includes('data')) return 'behavior';
-    if (mf && mf.moduleTypes.includes('resources')) return 'resource';
-    // 路径线索
-    const rel = path.relative(staging, packDir).replace(/\\/g, '/');
-    if (/behavior_packs\//.test(rel)) return 'behavior';
-    if (/resource_packs\//.test(rel)) return 'resource';
-    // 目录特征
-    try {
-      const names = fs.readdirSync(packDir).join(' ');
-      if (/\b(textures|models|texts|sounds|ui|render_controllers|materials)\b/.test(names)) return 'resource';
-      if (/\b(scripts|blocks|entities|items|recipes|spawn_rules)\b/.test(names)) return 'behavior';
-    } catch {}
-    throw new Error('无法识别包类型 (manifest 无 modules, 请手动指定 行为包/材质包)');
-  }
-
-  /** 从 zip 安装包到世界 (支持多个包; forcedType 可选) */
+  /** 从 zip 安装到全局库 (根目录), 不自动启用 */
+  /** 从 zip 安装到指定世界目录 (behavior_packs/resource_packs) 并自动启用 */
   installZip(world, tmpFile, forcedType) {
     const root = this._worldRoot(world);
     const staging = path.join(root, `.packs_staging_${Date.now()}_${Math.floor(Math.random() * 1e6)}`);
@@ -248,7 +283,6 @@ class Packs {
         const typeDir = type === 'behavior' ? 'behavior_packs' : 'resource_packs';
         const destBase = path.join(root, typeDir);
         fs.mkdirSync(destBase, { recursive: true });
-        // 目标文件夹名: 原文件夹名(清理); zip 根即包时用 header.name
         let base = path.basename(pd);
         if (path.resolve(pd) === path.resolve(staging)) base = mf?.headerName || 'pack';
         base = this._sanitize(base);
@@ -270,8 +304,14 @@ class Packs {
           arr.push({ pack_id: uuid, version: mf?.version || [1, 0, 0] });
           this._writeJsonArray(file, arr);
         }
-        const name = mf ? this._localizedName(dest, mf.headerName || base) : base;
-        installed.push({ folder: path.basename(dest), name, uuid, type, version: mf?.version?.join('.') || '1.0.0', enabled: true });
+        installed.push({
+          folder: path.basename(dest),
+          name: mf ? this._localizedName(dest, mf.headerName || base) : base,
+          uuid,
+          type,
+          version: mf?.version?.join('.') || '1.0.0',
+          enabled: true,
+        });
       }
       return { ok: true, world, installed };
     } finally {
@@ -279,7 +319,115 @@ class Packs {
     }
   }
 
-  /** 内置 zip 解压 (zlib + central directory; 免系统 unzip; 防 zip-slip) — 与 worlds.js 同逻辑 */
+  /** 从 zip 安装到全局库 (根目录), 不自动启用 */
+  installToLibrary(tmpFile, forcedType) {
+    const staging = path.join(this.worldDir, `.packs_staging_lib_${Date.now()}_${Math.floor(Math.random() * 1e6)}`);
+    fs.mkdirSync(staging, { recursive: true });
+    const installed = [];
+    try {
+      this._extractZip(tmpFile, staging);
+      const packDirs = this._discoverPacks(staging);
+      if (!packDirs.length) throw new Error('压缩包内未找到含 manifest.json 的行为/材质包');
+      for (const pd of packDirs) {
+        const mf = this._readManifest(pd);
+        const type = this._detectType(pd, forcedType, staging);
+        const typeDir = type === 'behavior' ? 'behavior_packs' : 'resource_packs';
+        const destBase = path.join(this.cfg.dir, typeDir);
+        fs.mkdirSync(destBase, { recursive: true });
+        let base = path.basename(pd);
+        if (path.resolve(pd) === path.resolve(staging)) base = mf?.headerName || 'pack';
+        base = this._sanitize(base);
+        let dest = path.join(destBase, base);
+        let n = 2;
+        while (fs.existsSync(dest)) { dest = path.join(destBase, `${base}_${n}`); n++; }
+        fs.mkdirSync(dest, { recursive: true });
+        for (const f of fs.readdirSync(pd)) {
+          const src = path.join(pd, f);
+          try { fs.renameSync(src, path.join(dest, f)); }
+          catch { fs.cpSync(src, path.join(dest, f), { recursive: true }); fs.rmSync(src, { recursive: true, force: true }); }
+        }
+        installed.push({
+          folder: path.basename(dest),
+          name: mf ? this._localizedName(dest, mf.headerName || base) : base,
+          uuid: mf?.uuid || '',
+          type,
+          version: mf?.version?.join('.') || '1.0.0',
+        });
+      }
+      return { ok: true, installed, note: '已上传到组件库, 到各世界配置中启用' };
+    } finally {
+      fs.rmSync(staging, { recursive: true, force: true });
+    }
+  }
+
+  /** 从全局库删除: 删根目录包 + 清空所有世界引用 */
+  removeLibrary(uuid) {
+    if (!uuid) throw new Error('缺少 uuid');
+    const found = this._findPackAnywhere(null, uuid);
+    if (!found || found.source !== 'library') throw new Error(`组件库中未找到该包 (uuid=${uuid})`);
+    const cleared = [];
+    for (const wname of this._listWorldDirs()) {
+      const wdir = path.join(this.worldDir, wname);
+      for (const rel of ['world_behavior_packs.json', 'world_resource_packs.json']) {
+        const file = path.join(wdir, rel);
+        const arr = this._readJsonArray(file);
+        const filtered = arr.filter(x => x.pack_id !== uuid);
+        if (filtered.length !== arr.length) {
+          this._writeJsonArray(file, filtered);
+          if (!cleared.includes(wname)) cleared.push(wname);
+        }
+      }
+    }
+    fs.rmSync(found.dir, { recursive: true, force: true });
+    return { ok: true, folder: found.folder, type: found.type, clearedFromWorlds: cleared };
+  }
+
+  // ---------- zip / staging 工具 ----------
+
+  /** 从已解压 staging 中识别包 (含 staging 根自身; 收集含 manifest.json 的目录) */
+  _discoverPacks(staging) {
+    const hits = [];
+    if (fs.existsSync(path.join(staging, 'manifest.json'))) {
+      hits.push(staging);
+      return hits;
+    }
+    const walk = (dir) => {
+      let entries;
+      try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+      for (const e of entries) {
+        if (e.name === '__MACOSX' || e.name === '.DS_Store' || e.name.startsWith('._')) continue;
+        const full = path.join(dir, e.name);
+        if (!e.isDirectory()) continue;
+        if (fs.existsSync(path.join(full, 'manifest.json'))) {
+          hits.push(full);
+          continue;
+        }
+        if (fs.existsSync(path.join(full, 'level.dat'))) continue;
+        walk(full);
+      }
+    };
+    walk(staging);
+    return hits;
+  }
+
+  /** 判断包类型: 指定 > manifest modules > 路径 > 特征 */
+  _detectType(packDir, forced, staging) {
+    if (forced === 'behavior' || forced === 'resource') return forced;
+    const mf = this._readManifest(packDir);
+    if (mf && mf.moduleTypes.includes('data')) return 'behavior';
+    if (mf && mf.moduleTypes.includes('resources')) return 'resource';
+    const rel = path.relative(staging, packDir).replace(/\\/g, '/');
+    if (/behavior_packs\//.test(rel)) return 'behavior';
+    if (/resource_packs\//.test(rel)) return 'resource';
+    try {
+      const names = fs.readdirSync(packDir).join(' ');
+      if (/\b(textures|models|texts|sounds|ui|render_controllers|materials)\b/.test(names)) return 'resource';
+      if (/\b(scripts|blocks|entities|items|recipes|spawn_rules)\b/.test(names)) return 'behavior';
+    } catch {}
+    throw new Error('无法识别包类型 (manifest 无 modules, 请手动指定 行为包/材质包)');
+  }
+
+  /** 内置 zip 解压 (zlib + central directory; 防 zip-slip) */
   _extractZip(zipFile, destDir) {
     const buf = fs.readFileSync(zipFile);
     let eocd = -1;
