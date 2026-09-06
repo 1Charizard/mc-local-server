@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const { execFile } = require('child_process');
 const { promisify } = require('util');
+const zlib = require('zlib');
 const execFileP = promisify(execFile);
 const https = require('https');
 const http = require('http');
@@ -107,45 +108,140 @@ class Worlds {
   }
 
   /** 核心: 解压/校验/移动为世界目录 */
+  // 支持"整个世界文件夹打包 zip": 解压后遍历整树定位 level.dat 所在目录(世界根),
+  // 无视 __MACOSX/.DS_Store/多级嵌套等夹带内容; 世界名智能回退 levelname.txt
   async _importFromFile(tmpFile, name) {
     const ext = tmpFile.match(/\.(zip|tar\.gz|tgz|mcworld)$/i)?.[1] || 'zip';
-    const baseName = name || 'uploaded_world_' + Date.now();
-    let targetName = baseName;
-    let target = path.join(this.worldDir, targetName);
-    let n = 2;
-    while (fs.existsSync(target)) {
-      targetName = `${baseName}_${n}`;
-      target = path.join(this.worldDir, targetName);
-      n++;
+    // 1) 解压到临时 staging
+    const staging = `/tmp/mc1life_stage_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+    fs.mkdirSync(staging, { recursive: true });
+    try {
+      if (ext === 'zip' || ext === 'mcworld') {
+        this._extractZip(tmpFile, staging);   // node 内置解压, 防 zip-slip
+      } else {
+        await execFileP('tar', ['-xzf', tmpFile, '-C', staging]);
+      }
+      // 2) 遍历整树定位所有 level.dat, 选最浅层 = 世界根
+      const hits = [];
+      this._findLevelDat(staging, staging, 0, hits);
+      if (!hits.length) throw new Error('上传的存档中未找到 level.dat, 可能不是有效的 Minecraft 世界');
+      hits.sort((a, b) => a.depth - b.depth || a.dir.length - b.dir.length);
+      const worldRoot = hits[0].dir;
+      if (hits.length > 1) console.log(`[MC1life] 存档内含多个 level.dat (${hits.length} 个), 取最浅: ${path.relative(staging, worldRoot)}`);
+      // 3) 确定世界名
+      let baseName = this._pickWorldName(staging, worldRoot, name);
+      let targetName = baseName;
+      let target = path.join(this.worldDir, targetName);
+      let n = 2;
+      while (fs.existsSync(target)) {
+        targetName = `${baseName}_${n}`;
+        target = path.join(this.worldDir, targetName);
+        n++;
+      }
+      // 4) 上移世界根内容到最终目录 (跳过打包夹带的垃圾项)
+      fs.mkdirSync(target, { recursive: true });
+      for (const f of fs.readdirSync(worldRoot)) {
+        if (f === '__MACOSX' || f === '.DS_Store' || f.startsWith('._')) continue;
+        fs.renameSync(path.join(worldRoot, f), path.join(target, f));
+      }
+      if (!fs.existsSync(path.join(target, 'level.dat'))) {
+        fs.rmSync(target, { recursive: true, force: true });
+        throw new Error('上传的存档缺少 level.dat, 可能不是有效的 Minecraft 世界');
+      }
+      console.log(`[MC1life] 世界导入成功: ${path.basename(target)} (内容来自 ${path.relative(staging, worldRoot) || 'zip 根'})`);
+      return { world: path.basename(target), ok: true };
+    } finally {
+      fs.rmSync(staging, { recursive: true, force: true });
     }
-    fs.mkdirSync(target, { recursive: true });
+  }
 
-    if (ext === 'zip' || ext === 'mcworld') {
-      await execFileP('unzip', ['-oq', tmpFile, '-d', target]);
-    } else {
-      await execFileP('tar', ['-xzf', tmpFile, '-C', target]);
+  /** 内置 zip 解压 (zlib + central directory; 免系统 unzip; 防 zip-slip 路径穿越) */
+  _extractZip(zipFile, destDir) {
+    const buf = fs.readFileSync(zipFile);
+    // 1) 从尾部找 EOCD (0x06054b50)
+    let eocd = -1;
+    for (let i = buf.length - 22; i >= Math.max(0, buf.length - 22 - 65536); i--) {
+      if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
     }
-    // 处理嵌套目录: 若解压后只有一层目录且含 level.dat, 上移
-    const items = fs.readdirSync(target);
-    if (items.length === 1) {
-      const inner = path.join(target, items[0]);
-      if (fs.statSync(inner).isDirectory()) {
-        const innerHasLevel = fs.existsSync(path.join(inner, 'level.dat'));
-        const outerHasLevel = fs.existsSync(path.join(target, 'level.dat'));
-        if (innerHasLevel && !outerHasLevel) {
-          // 逐个移动 (execFile 不经过 shell, glob 不展开)
-          for (const f of fs.readdirSync(inner)) {
-            fs.renameSync(path.join(inner, f), path.join(target, f));
+    if (eocd < 0) throw new Error('无效的 zip 文件 (找不到目录尾)');
+    const cdCount = buf.readUInt16LE(eocd + 10);
+    const cdOffset = buf.readUInt32LE(eocd + 16);
+    const realDir = path.resolve(destDir);
+    let off = cdOffset;
+    for (let n = 0; n < cdCount; n++) {
+      if (buf.readUInt32LE(off) !== 0x02014b50) throw new Error('zip 中央目录损坏');
+      const method = buf.readUInt16LE(off + 10);
+      const csize = buf.readUInt32LE(off + 20);
+      const nameLen = buf.readUInt16LE(off + 28);
+      const extraLen = buf.readUInt16LE(off + 30);
+      const commentLen = buf.readUInt16LE(off + 32);
+      const lho = buf.readUInt32LE(off + 42);
+      let name = buf.toString('utf8', off + 46, off + 46 + nameLen);
+      // 2) 安全校验: 拒绝绝对路径/../
+      const norm = path.normalize(name).replace(/\\/g, '/');
+      if (norm.startsWith('..') || path.isAbsolute(name) || norm.includes('../')) {
+        throw new Error(`zip 含非法路径, 已拒绝: ${name}`);
+      }
+      if (name.endsWith('/')) { off += 46 + nameLen + extraLen + commentLen; continue; } // 目录项
+      // 3) 读 local header 定位数据
+      if (buf.readUInt32LE(lho) !== 0x04034b50) throw new Error(`zip local header 损坏: ${name}`);
+      const lNameLen = buf.readUInt16LE(lho + 26);
+      const lExtraLen = buf.readUInt16LE(lho + 28);
+      const dataStart = lho + 30 + lNameLen + lExtraLen;
+      let data = buf.subarray(dataStart, dataStart + csize);
+      if (method === 8) data = zlib.inflateRawSync(data);
+      else if (method !== 0) throw new Error(`zip 不支持的压缩方式 ${method}: ${name}`);
+      const outPath = path.join(realDir, norm);
+      if (!outPath.startsWith(realDir + path.sep)) throw new Error(`zip 路径逃逸, 已拒绝: ${name}`);
+      fs.mkdirSync(path.dirname(outPath), { recursive: true });
+      fs.writeFileSync(outPath, data);
+      off += 46 + nameLen + extraLen + commentLen;
+    }
+  }
+
+  /** 递归找 level.dat (忽略隐藏/垃圾目录), 记录深度与目录 */
+  _findLevelDat(root, dir, depth, hits) {
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (e.name === '__MACOSX' || e.name.startsWith('._')) continue;
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        // 不深入 db/ (LevelDB 内部无 level.dat, 但避免遍历大目录)
+        if (e.name === 'db' || e.name === 'DIM-1' || e.name === 'DIM1') {
+          if (fs.existsSync(path.join(full, 'level.dat'))) {
+            hits.push({ dir: full, depth: depth + 1 });
           }
-          fs.rmdirSync(inner);
+          continue;
         }
+        this._findLevelDat(root, full, depth + 1, hits);
+      } else if (e.name === 'level.dat') {
+        hits.push({ dir, depth });
       }
     }
-    if (!fs.existsSync(path.join(target, 'level.dat'))) {
-      fs.rmSync(target, { recursive: true, force: true });
-      throw new Error('上传的存档缺少 level.dat, 可能不是有效的 Minecraft 世界');
+  }
+
+  /** 智能世界名: 显式名 > levelname.txt(当传入名像机器名时) > 单层目录名 > 兜底 */
+  _pickWorldName(staging, worldRoot, name) {
+    const looksMachine = !name || name.startsWith('uploaded_world') || /^[A-Za-z0-9+/=_-]{6,}$/.test(name);
+    if (!looksMachine) return this._sanitizeName(name);
+    // 尝试 levelname.txt
+    const lnPath = path.join(worldRoot, 'levelname.txt');
+    if (fs.existsSync(lnPath)) {
+      const ln = fs.readFileSync(lnPath, 'utf8').trim().replace(/\r/g, '').slice(0, 60);
+      if (ln) return this._sanitizeName(ln);
     }
-    return { world: path.basename(target), ok: true };
+    // 顶层恰单目录(且非 staging 根内容) → 用目录名
+    const top = fs.readdirSync(staging).filter(x => x !== '__MACOSX' && !x.startsWith('._') && x !== '.DS_Store');
+    if (top.length === 1 && worldRoot !== staging) {
+      const d = fs.statSync(path.join(staging, top[0]));
+      if (d.isDirectory() && path.join(staging, top[0]) === worldRoot) return this._sanitizeName(top[0]);
+    }
+    return this._sanitizeName(name || 'uploaded_world_' + Date.now());
+  }
+
+  _sanitizeName(n) {
+    return String(n).replace(/[\\/:*?"<>|]/g, '').replace(/\s+/g, ' ').trim().slice(0, 60) || 'world';
   }
 
   _download(url, dest) {
