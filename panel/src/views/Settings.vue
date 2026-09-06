@@ -34,6 +34,37 @@
       </div>
     </div>
 
+    <div class="panel db" :class="{ on: db && db.enabled }">
+      <h3>☠️ 玩家死亡自动备份</h3>
+      <p class="tip">每次玩家死亡自动保存"死亡瞬间世界快照"（含该玩家背包/血量/Buff/坐标/末影箱/基地等全部个人数据），可在「备份回滚」页恢复。与极限生存模式互相独立，可单独开关。</p>
+      <div class="hc-row">
+        <div class="hc-field">
+          <span class="label">当前状态</span>
+          <span class="badge" :class="db && db.enabled ? 'on' : 'off'">{{ db && db.enabled ? '已开启' : '已关闭' }}</span>
+          <span class="badge mode">每玩家保留 {{ (db && db.keepPerPlayer) || 3 }} 份</span>
+        </div>
+        <template v-if="isAdmin">
+          <div class="hc-field">
+            <span class="label">开关</span>
+            <button class="mini" :class="db && db.enabled ? 'danger' : 'ok'" :disabled="busyDb" @click="toggleDb">
+              {{ db && db.enabled ? '关闭死亡自动备份' : '开启死亡自动备份' }}
+            </button>
+          </div>
+          <div class="hc-field">
+            <span class="label">每玩家保留份数</span>
+            <div class="row-tight">
+              <input type="number" v-model.number="dbKeep" min="1" max="20" style="width:70px" />
+              <button class="mini ok" :disabled="busyDb || dbKeep === (db && db.keepPerPlayer)" @click="saveDbKeep">保存</button>
+            </div>
+          </div>
+        </template>
+        <div v-else class="hc-field">
+          <span class="label">权限</span>
+          <span class="tip">访客模式只读，无法修改</span>
+        </div>
+      </div>
+    </div>
+
     <div class="panel">
       <h3>配置文件</h3>
       <div class="tabs">
@@ -72,7 +103,7 @@
 
 <script setup>
 import { ref, computed, onMounted } from 'vue';
-import { getConfig, getConfigFiles, setConfig, getHardcore, setHardcore, getRole } from '../api';
+import { getConfig, getConfigFiles, setConfig, getHardcore, setHardcore, getDeathBackup, setDeathBackup, getRole } from '../api';
 
 const files = ref([]);
 const currentFile = ref('server.properties');
@@ -84,12 +115,45 @@ const newVal = ref('');
 const result = ref('');
 const busy = ref(false);
 const busyHc = ref(false);
+const busyDb = ref(false);
 const isAdmin = getRole() === 'admin';
 
 // 极限生存模式
 const hc = ref(null);
 const hcMode = ref('wipe');
 const modeText = computed(() => (hc.value?.mode === 'ban' ? '模式: 封禁玩家' : '模式: 删档重开'));
+
+// 死亡自动备份 (独立开关)
+const db = ref(null);
+const dbKeep = ref(3);
+async function loadDeathBackup() {
+  try {
+    const r = await getDeathBackup();
+    db.value = r.deathBackup || r || { enabled: true, keepPerPlayer: 3 };
+    dbKeep.value = db.value?.keepPerPlayer || 3;
+  } catch { db.value = { enabled: true, keepPerPlayer: 3 }; }
+}
+async function toggleDb() {
+  busyDb.value = true;
+  try {
+    const next = !(db.value?.enabled);
+    const r = await setDeathBackup(next, db.value?.keepPerPlayer);
+    db.value = r.deathBackup || { enabled: next, keepPerPlayer: db.value?.keepPerPlayer };
+    result.value = `死亡自动备份已${next ? '开启' : '关闭'}`;
+  } catch (e) { result.value = `操作失败: ${e.message}`; }
+  busyDb.value = false;
+}
+async function saveDbKeep() {
+  busyDb.value = true;
+  try {
+    const k = Math.max(1, Math.min(20, Number(dbKeep.value) || 3));
+    const r = await setDeathBackup(db.value?.enabled, k);
+    db.value = r.deathBackup || { enabled: db.value?.enabled, keepPerPlayer: k };
+    dbKeep.value = k;
+    result.value = `每玩家保留份数已设为 ${k}`;
+  } catch (e) { result.value = `操作失败: ${e.message}`; }
+  busyDb.value = false;
+}
 
 async function loadHardcore() {
   try {
@@ -149,13 +213,15 @@ async function save() {
   } catch (e) { result.value = `保存失败: ${e.message}`; }
   busy.value = false;
 }
-onMounted(async () => { await loadHardcore(); await refreshFiles(); loadFile('server.properties'); });
+onMounted(async () => { await loadHardcore(); await loadDeathBackup(); await refreshFiles(); loadFile('server.properties'); });
 </script>
 
 <style scoped>
 .panel { background: #fff; border-radius: 12px; padding: 18px; margin-top: 16px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
 .panel.hc { border-left: 4px solid #6b7280; }
 .panel.hc.on { border-left-color: #dc2626; }
+.panel.db { border-left: 4px solid #6b7280; }
+.panel.db.on { border-left-color: #b45309; }
 .panel h3 { font-size: 15px; margin-bottom: 10px; }
 .tip { color: #6b7280; font-size: 12.5px; margin-bottom: 12px; }
 .hc-row { display: flex; flex-wrap: wrap; gap: 18px; align-items: flex-start; }
@@ -165,6 +231,8 @@ onMounted(async () => { await loadHardcore(); await refreshFiles(); loadFile('se
 .badge.on { background: #fee2e2; color: #b91c1c; }
 .badge.off { background: #f3f4f6; color: #6b7280; }
 .badge.mode { background: #eef2ff; color: #4338ca; }
+.row-tight { display: flex; gap: 6px; align-items: center; }
+.row-tight input { padding: 6px 8px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 13px; }
 select { padding: 7px 10px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 13px; background: #fff; }
 .tabs { display: flex; flex-wrap: wrap; gap: 8px; }
 .tab { padding: 6px 14px; border: 1px solid #d1d5db; border-radius: 999px; background: #fff; font-size: 12.5px; cursor: pointer; }

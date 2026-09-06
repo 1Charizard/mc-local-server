@@ -309,6 +309,122 @@ app.post('/api/agent/export/complete', async (c) => {
   return c.json({ ok: true, exportId });
 });
 
+// ---- 备份分片端点 (Agent 备份/回滚经 Worker staging; 绕开服务器到 R2 的 TLS 阻断) ----
+// meta: { backupId, name, kind: manual|auto|death, player?, reason?, ts, totalChunks, size, rotation? }
+async function backupListAll(env) {
+  const rows = await env.DB.prepare("SELECT data FROM staging WHERE kind = 'backup' AND sub = 'meta.json'")
+    .all().catch(() => ({ results: [] }));
+  const out = [];
+  for (const r of rows.results || []) {
+    try {
+      const m = JSON.parse(r.data);
+      if (!m || !m.backupId) continue;
+      out.push({
+        backupId: m.backupId,
+        name: m.name || 'unknown',
+        kind: m.kind || 'manual',
+        player: m.player || '',
+        reason: m.reason || '',
+        ts: m.ts || 0,
+        size: m.size || 0,
+        totalChunks: m.totalChunks || 0,
+        fileName: m.fileName || `${m.name || 'backup'}.tar.gz`,
+        lastModified: m.ts ? new Date(m.ts).toISOString() : '',
+      });
+    } catch {}
+  }
+  return out.sort((a, b) => (b.ts > a.ts ? 1 : -1));
+}
+async function backupDelete(env, backupId) {
+  const rows = await env.DB.prepare("SELECT sub FROM staging WHERE kind = 'backup' AND id = ?").bind(backupId).all().catch(() => ({ results: [] }));
+  await stageCleanup(env, 'backup', backupId);
+  return (rows.results || []).length > 0;
+}
+/** 轮转: 按 meta.rotation {group, keep, globalKeep} 删除超出上限的最老备份 */
+async function backupRotate(env, meta) {
+  const rot = meta.rotation || {};
+  if (!rot.group) return;
+  const all = await backupListAll(env);
+  const list = all.filter(b => b.kind === rot.group);
+  let victims = [];
+  if (rot.keep && list.length > rot.keep) {
+    const sorted = [...list].sort((a, b) => a.ts - b.ts);
+    victims = sorted.slice(0, list.length - rot.keep);
+  }
+  if (rot.globalKeep && rot.group !== 'manual') {
+    const remain = all.filter(b => b.kind === rot.group && !victims.some(v => v.backupId === b.backupId));
+    if (remain.length > rot.globalKeep) {
+      const sorted = [...remain].sort((a, b) => a.ts - b.ts);
+      victims = victims.concat(sorted.slice(0, remain.length - rot.globalKeep));
+    }
+  }
+  for (const v of victims) await backupDelete(env, v.backupId).catch(() => {});
+  if (victims.length) console.log(`[backup-rotate] ${rot.group}: 清理 ${victims.length} 份旧备份`);
+}
+app.post('/api/agent/backup/start', async (c) => {
+  const agent = AUTH.checkAgent(c);
+  if (!agent) return c.json({ ok: false, error: '未授权' }, 401);
+  const { backupId, name, kind, player, reason, totalChunks, size, rotation } = await c.req.json().catch(() => ({}));
+  if (!backupId || !totalChunks) return c.json({ ok: false, error: '缺少参数' }, 400);
+  if (size > 500 * 1024 * 1024) return c.json({ ok: false, error: '备份过大 (>500MB)' }, 400);
+  const meta = { backupId, name: name || backupId, kind: kind || 'manual', player: player || '', reason: reason || '',
+    ts: Date.now(), totalChunks, size, rotation: rotation || null,
+    fileName: `${name || 'backup'}.tar.gz` };
+  await stagePut(c.env, r2u('backup', backupId, 'meta.json'), JSON.stringify(meta));
+  return c.json({ ok: true, backupId });
+});
+app.post('/api/agent/backup/chunk', async (c) => {
+  const agent = AUTH.checkAgent(c);
+  if (!agent) return c.json({ ok: false, error: '未授权' }, 401);
+  const { backupId, index, data } = await c.req.json().catch(() => ({}));
+  if (!backupId || index === undefined || !data) return c.json({ ok: false, error: '缺少分片参数' }, 400);
+  if (data.length > 1.1 * 1024 * 1024) return c.json({ ok: false, error: '分片过大 (>1.1MB base64)' }, 400);
+  await stagePut(c.env, r2u('backup', backupId, `chunk/${index}`), data);
+  return c.json({ ok: true, received: index + 1 });
+});
+app.post('/api/agent/backup/complete', async (c) => {
+  const agent = AUTH.checkAgent(c);
+  if (!agent) return c.json({ ok: false, error: '未授权' }, 401);
+  const { backupId } = await c.req.json().catch(() => ({}));
+  if (!backupId) return c.json({ ok: false, error: '缺少 backupId' }, 400);
+  const meta = await r2GetMeta(c.env, 'backup', backupId);
+  if (!meta) return c.json({ ok: false, error: '备份会话不存在' }, 404);
+  for (let i = 0; i < meta.totalChunks; i++) {
+    const o = await r2Head(c.env, r2u('backup', backupId, `chunk/${i}`));
+    if (o === null) return c.json({ ok: false, error: `分片缺失 (${i}/${meta.totalChunks})` }, 500);
+  }
+  try { await backupRotate(c.env, meta); } catch (e) { console.log('[backup-rotate] err:', e.message); }
+  return c.json({ ok: true, backupId });
+});
+app.get('/api/agent/backup/list', async (c) => {
+  const agent = AUTH.checkAgent(c);
+  if (!agent) return c.json({ ok: false, error: '未授权' }, 401);
+  return c.json({ ok: true, result: await backupListAll(c.env) });
+});
+app.get('/api/agent/backup/:id/:idx', async (c) => {
+  const agent = AUTH.checkAgent(c);
+  if (!agent) return c.json({ ok: false, error: '未授权' }, 401);
+  const { id, idx } = c.req.param();
+  const b64 = await r2GetText(c.env, r2u('backup', id, `chunk/${idx}`));
+  if (b64 === null) return c.json({ ok: false, error: '分片不存在或已过期' }, 404);
+  return new Response(b64, { headers: { 'Content-Type': 'text/plain' } });
+});
+app.post('/api/agent/backup/:id/cleanup', async (c) => {
+  const agent = AUTH.checkAgent(c);
+  if (!agent) return c.json({ ok: false, error: '未授权' }, 401);
+  const { id } = c.req.param();
+  await stageCleanup(c.env, 'backup', id);
+  return c.json({ ok: true });
+});
+app.post('/api/agent/backup/delete', async (c) => {
+  const agent = AUTH.checkAgent(c);
+  if (!agent) return c.json({ ok: false, error: '未授权' }, 401);
+  const { backupId } = await c.req.json().catch(() => ({}));
+  if (!backupId) return c.json({ ok: false, error: '缺少 backupId' }, 400);
+  const deleted = await backupDelete(c.env, backupId);
+  return c.json({ ok: deleted, deleted });
+});
+
 // ---------------- REST API ----------------
 app.get('/api/status', async (c) => {
   const online = await agentOnline(c.env);
@@ -386,22 +502,30 @@ app.post('/api/players/bans/time', async (c) => {
 });
 
 app.get('/api/backups', async (c) => {
-  const r = await submitCmd(c.env, 'listBackups', {});
-  if (!r.ok) return c.json(r);
-  return c.json({ result: r.result });
+  // 直查 D1 staging (不经 Agent/R2; Agent 离线也能列出)
+  const result = await backupListAll(c.env);
+  return c.json({ result });
 });
 app.post('/api/backups', async (c) => {
   const { name } = await c.req.json().catch(() => ({}));
   await logAudit(c.env, 'admin', 'backup', name || 'manual');
-  const r = await submitCmd(c.env, 'backup', { name });
+  const r = await submitCmd(c.env, 'backup', { name }, 300000);
   return c.json(r);
 });
 app.post('/api/backups/restore', async (c) => {
   const { backupId } = await c.req.json();
   if (!backupId) return c.json({ ok: false, error: '缺少 backupId' });
   await logAudit(c.env, 'admin', 'restore', backupId);
-  const r = await submitCmd(c.env, 'restore', { backupId });
+  const r = await submitCmd(c.env, 'restore', { backupId }, 600000);
   return c.json(r);
+});
+app.post('/api/backups/delete', async (c) => {
+  const { backupId } = await c.req.json().catch(() => ({}));
+  if (!backupId) return c.json({ ok: false, error: '缺少 backupId' }, 400);
+  await logAudit(c.env, 'admin', 'backup_delete', String(backupId));
+  const deleted = await backupDelete(c.env, backupId);
+  if (!deleted) return c.json({ ok: false, error: '备份不存在或已过期' }, 404);
+  return c.json({ ok: true, deleted: true });
 });
 
 app.get('/api/worlds', async (c) => {
@@ -632,6 +756,23 @@ app.post('/api/hardcore', async (c) => {
   if (mode && !['wipe', 'ban'].includes(mode)) return c.json({ ok: false, error: 'mode 仅支持 wipe/ban' });
   await logAudit(c.env, 'admin', 'hardcore_set', JSON.stringify({ enabled, mode }));
   const r = await submitCmd(c.env, 'setHardcore', { enabled, mode });
+  return c.json(r);
+});
+
+// 死亡自动备份配置 (玩家死亡自动存快照, 可自选开/关)
+app.get('/api/deathbackup', async (c) => {
+  const state = await readAgentState(c.env);
+  const db = state.deathBackup || { enabled: true, keepPerPlayer: 3, keepGlobal: 30 };
+  return c.json({ deathBackup: db });
+});
+app.post('/api/deathbackup', async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  const { enabled, keepPerPlayer, keepGlobal } = body;
+  if (typeof enabled !== 'boolean' && keepPerPlayer === undefined && keepGlobal === undefined) {
+    return c.json({ ok: false, error: '缺少参数' });
+  }
+  await logAudit(c.env, 'admin', 'deathbackup_set', JSON.stringify(body));
+  const r = await submitCmd(c.env, 'setDeathBackup', { enabled, keepPerPlayer, keepGlobal });
   return c.json(r);
 });
 

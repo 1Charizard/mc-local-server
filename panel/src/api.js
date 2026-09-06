@@ -67,6 +67,10 @@ export const setBanTime = (nameOrXuid, until) => req('/api/players/bans/time', {
 export const getBackups = () => req('/api/backups');
 export const createBackup = (name) => req('/api/backups', { method: 'POST', body: JSON.stringify({ name }) });
 export const restoreBackup = (backupId) => req('/api/backups/restore', { method: 'POST', body: JSON.stringify({ backupId }) });
+export const deleteBackup = (backupId) => req('/api/backups/delete', { method: 'POST', body: JSON.stringify({ backupId }) });
+// 死亡自动备份配置 (独立开关: 每次玩家死亡自动备份个人数据快照)
+export const getDeathBackup = () => req('/api/deathbackup');
+export const setDeathBackup = (enabled, keepPerPlayer) => req('/api/deathbackup', { method: 'POST', body: JSON.stringify({ enabled, keepPerPlayer }) });
 export const getWorlds = () => req('/api/worlds');
 export const switchWorld = (name) => req('/api/worlds/switch', { method: 'POST', body: JSON.stringify({ name }) });
 export const deleteWorld = (name) => req('/api/worlds/delete', { method: 'POST', body: JSON.stringify({ name }) });

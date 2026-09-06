@@ -25,6 +25,11 @@
     "keep": 5,
     "includeDirs": ["worlds", "server.properties", "whitelist.json", "permissions.json", "allowlist.json"]
   },
+  "deathBackup": {
+    "enabled": true,
+    "keepPerPlayer": 3,
+    "keepGlobal": 30
+  },
   "hardcore": {
     "enabled": true,
     "mode": "wipe"

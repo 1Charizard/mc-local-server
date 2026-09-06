@@ -7,20 +7,23 @@ const path = require('path');
 const fs = require('fs');
 
 // 基岩版 BDS 玩家死亡日志模式 (多版本兼容)
+// 基岩版 BDS 玩家死亡日志模式 (与 deathwatch.js 同步维护)
+// 真实日志头形如: [2026-09-07 05:00:00:000 INFO] Alice fell from a high place
 const DEATH_RE =
-  /^\[.*?\]\s*(?:INFO|WARN)\s*\](?:\s+)?(.+?)\s+(died|was slain|was killed|was shot|was blown|was pricked|was fireballed|was impaled|was squashed|was struck by lightning|was stung|was poked|was skewered|was flattened|was doomed|was smited|was scorched|was roasted|was fried|was electrocuted|was dragged into the void|was thrown into the void|fell out of the world|fell from a high place|fell off|suffocated|drowned|burned to death|tried to swim in lava|tried to fly with elytra|starved to death|blew up|hit the ground too hard|went up in flames|froze to death|experienced kinetic energy|was killed while trying to hurt|was killed by the intended death mechanics|was killed by \[)/i;
+  /^\[[^\]]*\]\s*(.+?)\s+(died|was slain|was killed|was shot|was blown|was pricked|was fireballed|was impaled|was squashed|was struck by lightning|was stung|was poked|was skewered|was flattened|was doomed|was smited|was scorched|was roasted|was fried|was electrocuted|was dragged into the void|was thrown into the void|fell out of the world|fell from a high place|fell off|suffocated|drowned|burned to death|tried to swim in lava|tried to fly with elytra|starved to death|blew up|hit the ground too hard|went up in flames|froze to death|experienced kinetic energy|was killed while trying to hurt|was killed by the intended death mechanics|was killed by \[)/i;
 
 class Hardcore {
   /**
    * @param {object} cfg - config.hardcore { enabled, mode }
    * @param {object} deps - { bds, rcon, backup, send }
    */
-  constructor(cfg, { bds, rcon, backup, send }) {
+  constructor(cfg, { bds, rcon, backup, send, shared }) {
     this.cfg = cfg || {};
     this.bds = bds;
     this.rcon = rcon;
     this.backup = backup;
     this.send = send;
+    this.shared = shared || { lastDeath: null };
     this._lastLine = '';
     this._pendingWipe = false;
   }
@@ -81,13 +84,23 @@ class Hardcore {
       const bdsCfg = this.bds.cfg;
       await this.send('hardcore', { action: 'wipe', player, line, phase: 'starting' });
 
-      // 1. 死亡前备份 (防丢档, 可恢复)
+      // 1. 死亡前备份 (防丢档, 可恢复) — 若死亡自动备份刚完成则复用, 避免双份
       await this.send('hardcore', { action: 'wipe', player, phase: 'backup' });
       let backupId = null;
       try {
-        const bk = await this.backup.create(`pre-death-${player.replace(/[^a-zA-Z0-9_-]/g, '')}`);
-        backupId = bk?.id || bk?.backupId || null;
-        console.log(`[MC1life] 死亡前备份完成: ${backupId || 'unknown'}`);
+        const last = this.shared.lastDeath;
+        const now = Date.now();
+        if (last && last.player === player && now - last.ts < 20000) {
+          backupId = last.backupId;
+          console.log(`[MC1life] 硬核删档: 复用死亡自动备份 ${backupId}`);
+        } else {
+          const bk = await this.backup.create(`pre-death-${player.replace(/[^a-zA-Z0-9_-]/g, '')}`, {
+            kind: 'death', player, reason: '硬核删档前备份 (极限死亡)',
+          });
+          backupId = bk?.backupId || null;
+          this.shared.lastDeath = { player, ts: Date.now(), backupId };
+          console.log(`[MC1life] 硬核删档: 死亡前备份完成 ${backupId || 'unknown'}`);
+        }
       } catch (e) {
         console.error('[MC1life] 死亡前备份失败, 继续删档:', e.message);
       }

@@ -15,6 +15,8 @@ function loadConfig() {
 }
 
 const config = loadConfig();
+// deathBackup 默认值 (面板可开关)
+config.deathBackup = { enabled: true, keepPerPlayer: 3, keepGlobal: 30, ...(config.deathBackup || {}) };
 const BDS = require('./bds');
 const RCON = require('./rcon');
 const WS = require('./ws');
@@ -23,20 +25,30 @@ const Worlds = require('./worlds');
 const Config = require('./config');
 const Hardcore = require('./hardcore');
 const Moderation = require('./moderation');
+const DeathWatch = require('./deathwatch');
 
 const rconTCP = new RCON(config.rcon);
 const bds = new BDS(config.bds, { rcon: rconTCP });
 // BDS 1.21.90+ 已移除 RCON → 所有管理指令统一走 BDS console (stdin/stdout)
 // 保持 rcon.exec 接口不变, 内部转发到 bds.exec
 const rcon = { exec: (cmd, timeoutMs) => bds.exec(cmd, timeoutMs) };
-const backup = new Backup(config.bds, config.r2, config.backup, bds, rcon);
+// 死亡自动备份与硬核删档共享"最近一次死亡备份"引用 (避免同一死亡备两份)
+const sharedDeath = { lastDeath: null };
+// backup 传输通道为 Worker staging (绕 R2 TLS 阻断); poll 实例后置绑定
+const backup = new Backup(config.bds, config.r2, {
+  ...config.backup,
+  deathKeepPerPlayer: config.deathBackup.keepPerPlayer,
+  deathKeepGlobal: config.deathBackup.keepGlobal,
+}, bds, rcon, null);
 const worlds = new Worlds(config.bds, bds);
 const Packs = require('./packs');
 const packs = new Packs(config.bds, bds);
 const cfg = new Config(config.bds);
-const hardcore = new Hardcore(config.hardcore, { bds, rcon, backup, send });
+const hardcore = new Hardcore(config.hardcore, { bds, rcon, backup, send, shared: sharedDeath });
 hardcore.start();
 const moderation = new Moderation(config.bds, bds, rcon).init();
+const deathwatch = new DeathWatch(config.deathBackup, { bds, backup, shared: sharedDeath });
+deathwatch.start();
 
 // 状态缓存
 const state = {
@@ -88,6 +100,9 @@ const poll = new WS(config, {
   },
 });
 
+// backup 通道依赖 poll 的 base/auth, 在此后置绑定
+backup.bindPoll && backup.bindPoll(poll);
+
 // 兼容 hardcore.send 的事件上报: 走日志输出 (Agent 侧可见), 不依赖 WS 推送
 function send(type, data) {
   console.log(`[MC1life] event:${type}`, JSON.stringify(data).slice(0, 300));
@@ -136,6 +151,7 @@ async function dispatch(kind, p) {
     case 'listBackups': return await backup.list();
     case 'backup': return await backup.create(p.name || 'manual');
     case 'restore': return await backup.restore(p.backupId);
+    case 'deleteBackup': return await backup.remove(p.backupId);
     case 'listWorlds': return await worlds.getCached();
     case 'deleteWorld': {
       const r = await worlds.delete(p.name);
@@ -159,6 +175,17 @@ async function dispatch(kind, p) {
       hardcore.update(hc);
       return { ok: true, hardcore: hc };
     }
+    case 'getDeathBackup': return { enabled: !!config.deathBackup?.enabled, keepPerPlayer: config.deathBackup?.keepPerPlayer, keepGlobal: config.deathBackup?.keepGlobal };
+    case 'setDeathBackup': {
+      const db = {
+        enabled: typeof p.enabled === 'boolean' ? p.enabled : !!config.deathBackup?.enabled,
+        keepPerPlayer: p.keepPerPlayer !== undefined ? Number(p.keepPerPlayer) : config.deathBackup?.keepPerPlayer,
+        keepGlobal: p.keepGlobal !== undefined ? Number(p.keepGlobal) : config.deathBackup?.keepGlobal,
+      };
+      saveHardcoreConfig(db, 'deathBackup');
+      deathwatch.update(db);
+      return { ok: true, deathBackup: db };
+    }
     case 'worldImportUpload': return handleWorldImportUpload(p);
     case 'worldUploadChunk': return handleUploadChunk(p);
     case 'worldUploadFinish': return handleUploadFinish(p);
@@ -177,13 +204,13 @@ async function dispatch(kind, p) {
   }
 }
 
-// ---------- 硬核配置持久化 ----------
-function saveHardcoreConfig(hc) {
-  config.hardcore = hc;
+// ---------- 配置持久化 (硬核/死亡备份通用) ----------
+function saveHardcoreConfig(obj, key = 'hardcore') {
+  config[key] = { ...(config[key] || {}), ...obj };
   try {
     fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf8');
   } catch (e) {
-    console.error('[MC1life] 硬核配置保存失败:', e.message);
+    console.error(`[MC1life] ${key} 配置保存失败:`, e.message);
   }
 }
 
@@ -439,6 +466,7 @@ async function collectStatus() {
     cpu: state.cpu,
     hostname: os.hostname(),
     hardcore: { enabled: !!config.hardcore?.enabled, mode: config.hardcore?.mode || 'wipe' },
+    deathBackup: { enabled: !!config.deathBackup?.enabled, keepPerPlayer: config.deathBackup?.keepPerPlayer, keepGlobal: config.deathBackup?.keepGlobal },
     worlds: await worlds.getCached(),
     ts: Date.now(),
   };
@@ -460,7 +488,7 @@ bds.on('log', (line) => {
   if (leave) state.players = state.players.filter(p => p !== leave[1]);
 });
 
-// 自动备份
+// 自动备份 (定时全量, kind=auto; 与手动/死亡备份独立)
 if (config.backup.auto) {
   const ms = (config.backup.intervalMinutes || 360) * 60000;
   setInterval(async () => {
@@ -472,6 +500,7 @@ if (config.backup.auto) {
 (async () => {
   console.log(`[MC1life] Agent 启动 (${config.agentId}), 轮询 ${config.workerUrl}`);
   console.log(`[MC1life] 硬核模式: ${config.hardcore?.enabled ? 'ON (' + (config.hardcore.mode || 'wipe') + ')' : 'OFF'}`);
+  console.log(`[MC1life] 死亡自动备份: ${config.deathBackup?.enabled ? 'ON' : 'OFF'}`);
   worlds.refreshCache();
   if (!bds.running) {
     console.log('[MC1life] BDS 未运行, 自动启动...');
