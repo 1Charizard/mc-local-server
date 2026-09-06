@@ -87,7 +87,7 @@ export const uploadWorld = (url, name) => req('/api/worlds/upload', { method: 'P
 // 前端分片上传存档 (绕开 CF 100MB 单请求限制, 上限 500MB; 每片失败自动重试 3 次)
 export async function uploadWorldFile(file, name, onProgress) {
   const MAX = 500 * 1024 * 1024;
-  const CHUNK = 1536 * 1024;
+  const CHUNK = 716 * 1024;  // 上传分片 716KB (base64 ~955KB 存 D1 staging, 单行安全)
   if (file.size > MAX) throw new Error(`文件过大 (${(file.size/1048576).toFixed(1)}MB), 上限 500MB`);
   if (file.size === 0) throw new Error('文件为空');
   const fileName = (name || file.name || 'world.zip').replace(/[\\/:*?"<>|]/g, '');

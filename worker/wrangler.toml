@@ -6,11 +6,6 @@ compatibility_date = "2024-06-01"
 [vars]
 ALLOWED_AGENT_ID = "mc1life"
 
-# R2 未启用 (导出存档走 KV 分片中转, 不依赖 R2)
-#[[r2_buckets]]
-#binding = "BACKUP_BUCKET"
-#bucket_name = "mc1life-backups"
-
 [[kv_namespaces]]
 binding = "SESSION_KV"
 id = "487f8a6d4a324c92a707bfb60d756404"

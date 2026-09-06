@@ -175,7 +175,7 @@ async function exportWorld(worldName) {
     const full = fs.readFileSync(tmpFile);
     const size = full.length;
     // 2. 分片 base64 上传 Worker (每片 1.5MB, KV 单值上限 25MB 内)
-    const CHUNK = 1536 * 1024;
+    const CHUNK = 716 * 1024;  // base64 ~955KB, D1 单行安全 (<1MB)
     const total = Math.ceil(size / CHUNK);
     const base = poll._base();
     const auth = poll._auth();

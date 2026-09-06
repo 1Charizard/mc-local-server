@@ -60,15 +60,60 @@ function bytesToB64(bytes) {
   }
   return btoa(bin);
 }
-const UPLOAD_KEY = 'agent:upload:';
+// ---- 分片暂存走 D1 staging 表 (KV 免费写配额 1000/天必超; R2 未启用; 分片 base64 需 <1MB) ----
+const r2u = (kind, id, sub) => `mc1life/${kind}/${id}${sub ? '/' + sub : ''}`;
+// key 形如 mc1life/{kind}/{id}/{sub}
+function parseKey(key) {
+  const parts = String(key).split('/');
+  return { kind: parts[1], id: parts[2], sub: parts.slice(3).join('/') };
+}
+async function stagePut(env, key, data) {
+  const { kind, id, sub } = parseKey(key);
+  await env.DB.prepare('INSERT INTO staging (kind, id, sub, data, ts) VALUES (?, ?, ?, ?, ?) ON CONFLICT(kind, id, sub) DO UPDATE SET data = excluded.data, ts = excluded.ts')
+    .bind(kind, id, sub, String(data), Date.now()).run().catch(() => {});
+}
+async function r2GetText(env, key) {
+  const { kind, id, sub } = parseKey(key);
+  const row = await env.DB.prepare('SELECT data FROM staging WHERE kind = ? AND id = ? AND sub = ?')
+    .bind(kind, id, sub).first().catch(() => null);
+  return row ? row.data : null;
+}
+async function r2GetMeta(env, kind, id) {
+  const t = await r2GetText(env, r2u(kind, id, 'meta.json'));
+  try { return t ? JSON.parse(t) : null; } catch { return null; }
+}
+async function r2Del(env, key) {
+  const { kind, id, sub } = parseKey(key);
+  await env.DB.prepare('DELETE FROM staging WHERE kind = ? AND id = ? AND sub = ?')
+    .bind(kind, id, sub).run().catch(() => {});
+}
+async function r2Head(env, key) {
+  const { kind, id, sub } = parseKey(key);
+  const row = await env.DB.prepare('SELECT 1 AS x FROM staging WHERE kind = ? AND id = ? AND sub = ? LIMIT 1')
+    .bind(kind, id, sub).first().catch(() => null);
+  return row ? { key } : null;
+}
+async function stageCleanup(env, kind, id) {
+  await env.DB.prepare('DELETE FROM staging WHERE kind = ? AND id = ?').bind(kind, id).run().catch(() => {});
+}
 
-// Agent 在线判定: KV state 存在且 45 秒内更新过
+// 读取 Agent 心跳状态 (D1 agent_state; 高频写走 KV 会超免费 1000 次/天配额)
+async function readAgentState(env) {
+  const aid = env.ALLOWED_AGENT_ID || 'mc1life';
+  const row = await env.DB.prepare('SELECT state FROM agent_state WHERE agent_id = ?')
+    .bind(aid).first().catch(() => null);
+  if (!row) return {};
+  try { return JSON.parse(row.state); } catch { return {}; }
+}
+
+// Agent 在线判定: D1 agent_state.ts 120 秒内更新过
 async function agentOnline(env) {
   try {
-    const s = await env.SESSION_KV.get(STATE_KEY, 'json');
-    if (!s) return false;
-    // 手机弱网容忍: 心跳 8s + 失败立即重试, 120s 窗口几乎不会误判
-    return Date.now() - (s.ts || 0) < 120000;
+    const aid = env.ALLOWED_AGENT_ID || 'mc1life';
+    const row = await env.DB.prepare('SELECT ts FROM agent_state WHERE agent_id = ?')
+      .bind(aid).first().catch(() => null);
+    if (!row) return false;
+    return Date.now() - (row.ts || 0) < 120000;
   } catch { return false; }
 }
 
@@ -160,12 +205,24 @@ app.post('/api/agent/heartbeat', async (c) => {
   if (!agent) return c.json({ ok: false, error: '未授权' }, 401);
   const body = await c.req.json().catch(() => ({}));
   const state = { ...(body.status || {}), ts: Date.now() };
-  await c.env.SESSION_KV.put(STATE_KEY, JSON.stringify(state));
-  // 日志追加 (最多 500 行)
+  try {
+    await c.env.DB.prepare(
+      'INSERT INTO agent_state (agent_id, state, ts) VALUES (?, ?, ?) ON CONFLICT(agent_id) DO UPDATE SET state = excluded.state, ts = excluded.ts'
+    ).bind(agent, JSON.stringify(state), state.ts).run();
+  } catch (e) {
+    return c.json({ ok: false, error: 'hb-state: ' + e.name + ' ' + e.message }, 500);
+  }
   if (Array.isArray(body.logs) && body.logs.length) {
-    const prev = JSON.parse((await c.env.SESSION_KV.get('agent:logs')) || '[]');
-    const merged = [...prev, ...body.logs].slice(-500);
-    await c.env.SESSION_KV.put('agent:logs', JSON.stringify(merged));
+    try {
+      const stmts = body.logs.slice(0, 100).map(l =>
+        c.env.DB.prepare('INSERT INTO agent_logs (agent_id, line) VALUES (?, ?)').bind(agent, String(l).slice(0, 2000))
+      );
+      await c.env.DB.batch(stmts);
+      await c.env.DB.prepare('DELETE FROM agent_logs WHERE agent_id = ? AND id NOT IN (SELECT id FROM agent_logs WHERE agent_id = ? ORDER BY id DESC LIMIT 500)')
+        .bind(agent, agent).run();
+    } catch (e) {
+      return c.json({ ok: false, error: 'hb-logs: ' + e.name + ' ' + e.message }, 500);
+    }
   }
   return c.json({ ok: true, ts: state.ts });
 });
@@ -199,12 +256,12 @@ app.post('/api/agent/result', async (c) => {
   return c.json({ ok: true });
 });
 
-// Agent 拉取上传分片 (面板上传存档时 KV 暂存, Agent 按 index 拉取)
+// Agent 拉取上传分片 (面板上传存档时 R2 暂存, Agent 按 index 拉取)
 app.get('/api/agent/upload/:id/:idx', async (c) => {
   const agent = AUTH.checkAgent(c);
   if (!agent) return c.json({ ok: false, error: '未授权' }, 401);
   const { id, idx } = c.req.param();
-  const b64 = await c.env.SESSION_KV.get(`${UPLOAD_KEY}${id}:chunk:${idx}`);
+  const b64 = await r2GetText(c.env, r2u('upload', id, `chunk/${idx}`));
   if (b64 === null) return c.json({ ok: false, error: '分片不存在或已过期' }, 404);
   return new Response(b64, { headers: { 'Content-Type': 'text/plain' } });
 });
@@ -214,25 +271,19 @@ app.post('/api/agent/upload/:id/cleanup', async (c) => {
   const agent = AUTH.checkAgent(c);
   if (!agent) return c.json({ ok: false, error: '未授权' }, 401);
   const { id } = c.req.param();
-  const meta = JSON.parse((await c.env.SESSION_KV.get(`${UPLOAD_KEY}${id}:meta`)) || 'null');
-  if (meta) {
-    for (let i = 0; i < meta.totalChunks; i++) {
-      await c.env.SESSION_KV.delete(`${UPLOAD_KEY}${id}:chunk:${i}`);
-    }
-    await c.env.SESSION_KV.delete(`${UPLOAD_KEY}${id}:meta`);
-  }
+  await stageCleanup(c.env, 'upload', id);
   return c.json({ ok: true });
 });
 
-// ---- 导出上传端点 (Agent 分片 POST, KV 暂存, TTL 1h) ----
-const EXPORT_KEY = 'export:';
+// ---- 导出上传端点 (Agent 分片 POST, R2 暂存) ----
 app.post('/api/agent/export/start', async (c) => {
   const agent = AUTH.checkAgent(c);
   if (!agent) return c.json({ ok: false, error: '未授权' }, 401);
   const { exportId, worldName, totalChunks, size, fileName } = await c.req.json().catch(() => ({}));
   if (!exportId || !totalChunks) return c.json({ ok: false, error: '缺少参数' }, 400);
   if (size > 500 * 1024 * 1024) return c.json({ ok: false, error: '世界过大 (>500MB)' }, 400);
-  await c.env.SESSION_KV.put(`${EXPORT_KEY}${exportId}:meta`, JSON.stringify({ exportId, worldName, totalChunks, size, fileName, ts: Date.now() }), { expirationTtl: 3600 });
+  await stagePut(c.env, r2u('export', exportId, 'meta.json'),
+    JSON.stringify({ exportId, worldName, totalChunks, size, fileName, ts: Date.now() }));
   return c.json({ ok: true });
 });
 app.post('/api/agent/export/chunk', async (c) => {
@@ -240,8 +291,8 @@ app.post('/api/agent/export/chunk', async (c) => {
   if (!agent) return c.json({ ok: false, error: '未授权' }, 401);
   const { exportId, index, data } = await c.req.json().catch(() => ({}));
   if (!exportId || index === undefined || !data) return c.json({ ok: false, error: '缺少分片参数' }, 400);
-  if (data.length > 2.2 * 1024 * 1024) return c.json({ ok: false, error: '分片过大' }, 400);
-  await c.env.SESSION_KV.put(`${EXPORT_KEY}${exportId}:chunk:${index}`, data, { expirationTtl: 3600 });
+  if (data.length > 1.1 * 1024 * 1024) return c.json({ ok: false, error: '分片过大 (>1.1MB base64)' }, 400);
+  await stagePut(c.env, r2u('export', exportId, `chunk/${index}`), data);
   return c.json({ ok: true, received: index + 1 });
 });
 app.post('/api/agent/export/complete', async (c) => {
@@ -249,12 +300,11 @@ app.post('/api/agent/export/complete', async (c) => {
   if (!agent) return c.json({ ok: false, error: '未授权' }, 401);
   const { exportId } = await c.req.json().catch(() => ({}));
   if (!exportId) return c.json({ ok: false, error: '缺少 exportId' }, 400);
-  // 验证分片齐全
-  const meta = JSON.parse((await c.env.SESSION_KV.get(`${EXPORT_KEY}${exportId}:meta`)) || 'null');
+  const meta = await r2GetMeta(c.env, 'export', exportId);
   if (!meta) return c.json({ ok: false, error: '导出会话不存在' }, 404);
   for (let i = 0; i < meta.totalChunks; i++) {
-    const ck = await c.env.SESSION_KV.get(`${EXPORT_KEY}${exportId}:chunk:${i}`);
-    if (ck === null) return c.json({ ok: false, error: `分片缺失 (${i}/${meta.totalChunks})` }, 500);
+    const o = await r2Head(c.env, r2u('export', exportId, `chunk/${i}`));
+    if (o === null) return c.json({ ok: false, error: `分片缺失 (${i}/${meta.totalChunks})` }, 500);
   }
   return c.json({ ok: true, exportId });
 });
@@ -263,13 +313,16 @@ app.post('/api/agent/export/complete', async (c) => {
 app.get('/api/status', async (c) => {
   const online = await agentOnline(c.env);
   if (!online) return c.json({ ok: false, agent: 'offline' }, 200);
-  const state = JSON.parse((await c.env.SESSION_KV.get(STATE_KEY)) || '{}');
+  const state = await readAgentState(c.env);
   return c.json(state);
 });
 
 app.get('/api/logs', async (c) => {
-  const logs = JSON.parse((await c.env.SESSION_KV.get('agent:logs')) || '[]');
-  return c.json({ lines: logs, total: logs.length });
+  const aid = c.env.ALLOWED_AGENT_ID || 'mc1life';
+  const rows = await c.env.DB.prepare('SELECT line FROM agent_logs WHERE agent_id = ? ORDER BY id DESC LIMIT 500')
+    .bind(aid).all().catch(() => ({ results: [] }));
+  const lines = (rows.results || []).map(r => r.line).reverse();
+  return c.json({ lines, total: lines.length });
 });
 
 app.post('/api/cmd', async (c) => {
@@ -286,7 +339,7 @@ app.post('/api/server/stop', async (c) => c.json(await submitCmd(c.env, 'stop', 
 app.post('/api/server/restart', async (c) => c.json(await submitCmd(c.env, 'restart', {})));
 
 app.get('/api/players', async (c) => {
-  const state = JSON.parse((await c.env.SESSION_KV.get(STATE_KEY)) || '{}');
+  const state = await readAgentState(c.env);
   return c.json({ result: state.players || [] });
 });
 
@@ -324,7 +377,7 @@ app.post('/api/backups/restore', async (c) => {
 
 app.get('/api/worlds', async (c) => {
   // 优先读 Agent 心跳上报的世界列表缓存 (即时返回, 不阻塞等 Agent)
-  const state = JSON.parse((await c.env.SESSION_KV.get(STATE_KEY)) || '{}');
+  const state = await readAgentState(c.env);
   if (Array.isArray(state.worlds)) return c.json({ result: state.worlds, cached: true });
   // Agent 在线但还没上报世界列表 (刚启动/导入中): 快速返回, 避免面板卡 25s 超时
   if (state && state.ts && Date.now() - state.ts < 120000) {
@@ -354,11 +407,11 @@ app.post('/api/worlds/export', async (c) => {
   const r = await submitCmd(c.env, 'worldExport', { name }, 300000);
   return c.json(r);
 });
-// 导出下载: 分片端点 (前端循环拉 base64 拼接, 绕开 Worker CPU 限制)
+// 导出下载: 分片端点 (前端循环拉 base64 拼接, 绕开 Worker CPU 限制; R2 暂存)
 app.get('/api/worlds/export/meta', async (c) => {
   const id = c.req.query('id') || '';
   if (!id || !id.startsWith('exp_')) return c.json({ ok: false, error: '缺少有效 id' }, 400);
-  const meta = JSON.parse((await c.env.SESSION_KV.get(`export:${id}:meta`)) || 'null');
+  const meta = await r2GetMeta(c.env, 'export', id);
   if (!meta) return c.json({ ok: false, error: '导出不存在或已过期' }, 404);
   return c.json({ ok: true, meta });
 });
@@ -366,12 +419,13 @@ app.get('/api/worlds/export/chunk', async (c) => {
   const id = c.req.query('id') || '';
   const i = Number(c.req.query('i') || '0');
   if (!id || !id.startsWith('exp_')) return c.json({ ok: false, error: '缺少有效 id' }, 400);
-  const b64 = await c.env.SESSION_KV.get(`export:${id}:chunk:${i}`);
+  const b64 = await r2GetText(c.env, r2u('export', id, `chunk/${i}`));
   if (b64 === null) return c.json({ ok: false, error: '分片缺失或已过期' }, 404);
   return new Response(b64, { headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
 });
 
-// 网页上传存档 (multipart) -> base64 存 KV 暂存 -> Agent 拉取并导入
+// ---- 网页上传存档: 分片经 R2 暂存 -> Agent 拉取并导入 ----
+// 旧 multipart 接口 (90MB 上限, 兼容旧前端; 新前端走 upload/start 分片)
 app.post('/api/worlds/upload', async (c) => {
   if (!(await agentOnline(c.env))) return c.json({ ok: false, error: 'Agent 当前离线, 无法上传存档' }, 503);
   let form;
@@ -383,31 +437,22 @@ app.post('/api/worlds/upload', async (c) => {
   if (buf.byteLength === 0) return c.json({ ok: false, error: '文件为空' }, 400);
   const MAX = 90 * 1024 * 1024;
   if (buf.byteLength > MAX) return c.json({ ok: false, error: `文件过大 (${(buf.byteLength/1048576).toFixed(1)}MB), 上限 90MB` }, 400);
-
-  // 分片 base64, 每片 1.5MB (KV 单值上限 25MB, 90MB 文件需 ~60 片)
   const CHUNK = 1536 * 1024;
   const uploadId = crypto.randomUUID().slice(0, 8);
   const total = Math.ceil(buf.byteLength / CHUNK);
   const baseName = name.replace(/\.(zip|mcworld|tar\.gz|tgz)$/i, '').replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 60) || 'uploaded_world';
   await logAudit(c.env, 'admin', 'world_upload', `${name} (${(buf.byteLength/1048576).toFixed(1)}MB, ${total}片)`);
-
-  // 元数据 + 分片写入 KV
-  const meta = { uploadId, fileName: name, worldName: baseName, totalChunks: total, received: 0, ts: Date.now() };
-  await c.env.SESSION_KV.put(UPLOAD_KEY + uploadId + ':meta', JSON.stringify(meta), { expirationTtl: 1800 });
+  const meta = { uploadId, fileName: name, worldName: baseName, totalChunks: total, ts: Date.now() };
+  await stagePut(c.env, r2u('upload', uploadId, 'meta.json'), JSON.stringify(meta));
   for (let i = 0; i < total; i++) {
     const slice = buf.slice(i * CHUNK, Math.min((i + 1) * CHUNK, buf.byteLength));
-    const b64 = bytesToB64(slice);
-    await c.env.SESSION_KV.put(UPLOAD_KEY + uploadId + ':chunk:' + i, b64, { expirationTtl: 1800 });
+    await stagePut(c.env, r2u('upload', uploadId, `chunk/${i}`), bytesToB64(slice));
   }
-  // 通知 Agent: 入队导入指令
   const r = await submitCmd(c.env, 'worldImportUpload', { uploadId, fileName: name, worldName: baseName, totalChunks: total }, 180000);
   return c.json(r);
 });
 
-// ---- 前端分片上传 (绕开 CF 100MB 单请求限制, 上限 500MB) ----
-// POST /api/worlds/upload/start {fileName,size} -> {uploadId,totalChunks,worldName}
-// POST /api/worlds/upload/chunk?id=&i=  body: 二进制分片
-// POST /api/worlds/upload/finish {uploadId} -> 校验+入队 (不等待, 避免长超时)
+// ---- 前端分片上传 (绕开 CF 100MB 单请求限制, 上限 500MB; R2 暂存) ----
 const MAX_UPLOAD = 500 * 1024 * 1024;
 const UPLOAD_CHUNK = 1536 * 1024;
 
@@ -420,8 +465,12 @@ app.post('/api/worlds/upload/start', async (c) => {
   const uploadId = crypto.randomUUID().slice(0, 8);
   const totalChunks = Math.ceil(size / UPLOAD_CHUNK);
   const worldName = fileName.replace(/\.(zip|mcworld|tar\.gz|tgz)$/i, '').replace(/[\/:*?"<>|\s]+/g, '_').slice(0, 60) || 'uploaded_world';
-  const meta = { uploadId, fileName: worldName, size, totalChunks, received: 0, ts: Date.now() };
-  await c.env.SESSION_KV.put(UPLOAD_KEY + uploadId + ':meta', JSON.stringify(meta), { expirationTtl: 3600 });
+  const meta = { uploadId, fileName: worldName, size, totalChunks, ts: Date.now() };
+  try {
+    await stagePut(c.env, r2u('upload', uploadId, 'meta.json'), JSON.stringify(meta));
+  } catch (e) {
+    return c.json({ ok: false, error: 'start-stage: ' + e.name + ' ' + e.message }, 500);
+  }
   return c.json({ ok: true, uploadId, totalChunks, worldName });
 });
 
@@ -429,30 +478,26 @@ app.post('/api/worlds/upload/chunk', async (c) => {
   const uploadId = c.req.query('id') || '';
   const index = Number(c.req.query('i') || '0');
   if (!uploadId) return c.json({ ok: false, error: '缺少 uploadId' }, 400);
-  const meta = JSON.parse((await c.env.SESSION_KV.get(UPLOAD_KEY + uploadId + ':meta')) || 'null');
+  const meta = await r2GetMeta(c.env, 'upload', uploadId);
   if (!meta) return c.json({ ok: false, error: '上传会话不存在或已过期' }, 404);
   if (index < 0 || index >= meta.totalChunks) return c.json({ ok: false, error: '分片越界' }, 400);
   const buf = new Uint8Array(await c.req.arrayBuffer());
   if (buf.byteLength === 0) return c.json({ ok: false, error: '分片为空' }, 400);
-  const b64 = bytesToB64(buf);
-  await c.env.SESSION_KV.put(UPLOAD_KEY + uploadId + ':chunk:' + index, b64, { expirationTtl: 3600 });
-  meta.received = Math.max(meta.received, index + 1);
-  await c.env.SESSION_KV.put(UPLOAD_KEY + uploadId + ':meta', JSON.stringify(meta), { expirationTtl: 3600 });
-  return c.json({ ok: true, received: meta.received, total: meta.totalChunks });
+  await stagePut(c.env, r2u('upload', uploadId, `chunk/${index}`), bytesToB64(buf));
+  return c.json({ ok: true, received: index + 1, total: meta.totalChunks });
 });
 
 app.post('/api/worlds/upload/finish', async (c) => {
   const { uploadId } = await c.req.json().catch(() => ({}));
   if (!uploadId) return c.json({ ok: false, error: '缺少 uploadId' }, 400);
-  const meta = JSON.parse((await c.env.SESSION_KV.get(UPLOAD_KEY + uploadId + ':meta')) || 'null');
+  const meta = await r2GetMeta(c.env, 'upload', uploadId);
   if (!meta) return c.json({ ok: false, error: '上传会话不存在或已过期' }, 404);
   for (let i = 0; i < meta.totalChunks; i++) {
-    const ck = await c.env.SESSION_KV.get(UPLOAD_KEY + uploadId + ':chunk:' + i);
-    if (ck === null) return c.json({ ok: false, error: `分片缺失 (${i}/${meta.totalChunks})` }, 500);
+    const o = await r2Head(c.env, r2u('upload', uploadId, `chunk/${i}`));
+    if (o === null) return c.json({ ok: false, error: `分片缺失 (${i}/${meta.totalChunks})` }, 500);
   }
   if (!(await agentOnline(c.env))) return c.json({ ok: false, error: 'Agent 当前离线, 无法导入存档' }, 503);
   await logAudit(c.env, 'admin', 'world_upload', `${meta.fileName} (${(meta.size/1048576).toFixed(1)}MB, ${meta.totalChunks}片)`);
-  // 入队指令 (D1), 不等待结果 (Agent 后台导入, 面板轮询世界列表可见)
   const tid = crypto.randomUUID();
   const tpayload = JSON.stringify({ kind: 'worldImportUpload', payload: { uploadId, fileName: meta.fileName, worldName: meta.worldName || meta.fileName, totalChunks: meta.totalChunks } });
   await c.env.DB.prepare('INSERT INTO tasks (id, type, status, payload) VALUES (?, ?, ?, ?)')
@@ -462,7 +507,7 @@ app.post('/api/worlds/upload/finish', async (c) => {
 
 // 硬核模式配置
 app.get('/api/hardcore', async (c) => {
-  const state = JSON.parse((await c.env.SESSION_KV.get(STATE_KEY)) || '{}');
+  const state = await readAgentState(c.env);
   const hc = state.hardcore || { enabled: false, mode: 'wipe' };
   return c.json({ hardcore: hc });
 });
