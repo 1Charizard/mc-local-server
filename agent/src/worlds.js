@@ -114,14 +114,21 @@ class Worlds {
   // 支持"整个世界文件夹打包 zip": 解压后遍历整树定位 level.dat 所在目录(世界根),
   // 无视 __MACOSX/.DS_Store/多级嵌套等夹带内容; 世界名智能回退 levelname.txt
   async _importFromFile(tmpFile, name) {
-    const ext = tmpFile.match(/\.(zip|tar\.gz|tgz|mcworld)$/i)?.[1] || 'zip';
+    // 用 magic bytes 探测真实格式 (文件名可能无扩展名/被改名, 不再依赖扩展名)
+    const head = fs.readFileSync(tmpFile).subarray(0, 4);
+    const magic = head.toString('hex');
+    let ext = 'zip';
+    if (head[0] === 0x50 && head[1] === 0x4b && head[2] === 0x03 && head[3] === 0x04) ext = 'zip';       // PK\x03\x04
+    else if (head[0] === 0x50 && head[1] === 0x4b && head[2] === 0x05 && head[3] === 0x06) ext = 'zip';  // 空 zip (PK\x05\x06)
+    else if (head[0] === 0x1f && head[1] === 0x8b) ext = 'tar.gz';                                       // gzip (tar.gz 或 .gz)
+    else throw new Error(`无法识别的存档格式 (magic=0x${magic}), 请上传 zip 或 tar.gz 打包的世界文件夹`);
     // 1) 解压到临时 staging (放 worldDir 内 = 同文件系统, 避免跨设备 rename EXDEV)
     fs.mkdirSync(this.worldDir, { recursive: true });
     const staging = path.join(this.worldDir, `.staging_${Date.now()}_${Math.floor(Math.random() * 1e6)}`);
     fs.mkdirSync(staging, { recursive: true });
     let target = null;   // 记录已建目标目录, 失败时清理
     try {
-      if (ext === 'zip' || ext === 'mcworld') {
+      if (ext === 'zip') {
         this._extractZip(tmpFile, staging);   // node 内置解压, 防 zip-slip
       } else {
         await execFileP('tar', ['-xzf', tmpFile, '-C', staging]);

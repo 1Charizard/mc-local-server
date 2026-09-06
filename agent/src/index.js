@@ -269,6 +269,12 @@ async function handleWorldImportUpload(p) {
       });
     } catch {}
     return { ok: true, world: result.world, note: bds.running ? '服务器运行中, 请在面板切换到该世界' : undefined };
+  } catch (e) {
+    // 失败时保留拼接文件 (uploads/inspect_*), 供诊断: 文件格式/完整性
+    const keep = `/opt/mc1life/uploads/inspect_${uploadId}${path.extname(tmpFile) || '.bin'}`;
+    try { fs.renameSync(tmpFile, keep); console.log(`[MC1life] 导入失败, 已保留文件供诊断: ${keep}`); }
+    catch { try { fs.unlinkSync(tmpFile); } catch {} }
+    throw e;
   } finally {
     try { fs.unlinkSync(tmpFile); } catch {}
   }
