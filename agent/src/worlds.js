@@ -39,6 +39,8 @@ class Worlds {
       const dir = path.join(this.worldDir, entry.name);
       const stat = fs.statSync(dir);
       const hasLevel = fs.existsSync(path.join(dir, 'level.dat'));
+      // paper 模式: 只列含 level.dat 的世界 (跳过插件/配置等杂物)
+      if (this.cfg.mode === 'paper' && !hasLevel) continue;
       out.push({
         name: entry.name,
         size: await this._dirSize(dir),

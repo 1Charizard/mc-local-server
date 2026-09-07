@@ -9,7 +9,7 @@ class BDS extends EventEmitter {
   constructor(cfg, { rcon }) {
     super();
     this.cfg = cfg;
-    this.rcon = rcon; // 保留兼容 (RCON 不可用时走 console)
+    this.rcon = rcon; // 保留兼容 (RCON 可用时走 TCP; BDS 1.21.90+ 无 RCON 走 console)
     this.proc = null;
     this.running = false;
     this.pid = null;
@@ -23,6 +23,8 @@ class BDS extends EventEmitter {
     this._active = null;         // 当前活动命令 (exec 严格串行)
     this._chain = Promise.resolve();
     this._lineBuffer = '';
+    // 引擎模式: 'bds' (Bedrock 官方服, console 指令) | 'paper' (Java Paper, RCON 指令)
+    this._paper = cfg.mode === 'paper';
   }
 
   get logBuffer() { return this._logBuffer; }
@@ -36,10 +38,21 @@ class BDS extends EventEmitter {
     return this._version;
   }
 
-  /** 向 BDS 控制台发命令并等待响应 (解析 stdout, 静默期判定结束) */
-  // 真实 BDS (1.21.90+) 管道下不回显命令 → 写命令后收集输出行, 500ms 无新输出判定响应完成
-  // exec 严格串行: 心跳 collectPlayers 与 poll 指令可能并发, 必须排队避免响应串扰
+  /** 向服务器控制台发命令并等待响应
+   *  paper 模式: 走标准 RCON (TCP 25575)
+   *  bds 模式:   BDS 1.21.90+ 无 RCON, 写 stdin 后收集 stdout, 500ms 无新输出判定响应完成
+   *  exec 严格串行: 心跳 collectPlayers 与 poll 指令可能并发, 必须排队避免响应串扰 */
   exec(cmd, timeoutMs = 15000) {
+    if (this._paper) {
+      // Paper RCON: rcon.exec 自带重连/重试
+      if (!this.rcon || typeof this.rcon.exec !== 'function') {
+        return Promise.reject(new Error('RCON 不可用 (paper 模式)'));
+      }
+      return Promise.resolve().then(() => this.rcon.exec(cmd)).catch(err => {
+        // 统一抛 Error, 与 bds 模式一致
+        throw (err instanceof Error ? err : new Error(String(err)));
+      });
+    }
     const task = this._chain.then(() => this._execOne(cmd, timeoutMs));
     this._chain = task.catch(() => {});
     return task;
@@ -107,8 +120,8 @@ class BDS extends EventEmitter {
     this._restarting = false;
     const script = this.cfg.runScript;
     if (!fs.existsSync(script)) throw new Error(`运行脚本不存在: ${script}`);
-    this._log('info', '正在启动 BDS ...');
-    // run.sh 内部 cd 到 bds 目录; stdin/stdout 用管道 (console 控制台通道)
+    this._log('info', `正在启动 ${this._paper ? 'Paper' : 'BDS'} ...`);
+    // run.sh 内部 cd 到服务端目录; stdin/stdout 用管道 (console 控制台通道)
     this.proc = spawn('bash', [script], { cwd: this.cfg.dir, env: process.env });
     this.pid = this.proc.pid;
     this.running = true;
@@ -117,7 +130,7 @@ class BDS extends EventEmitter {
     this.proc.stderr.on('data', chunk => this._feed(chunk.toString()));
     this.proc.on('error', err => this._log('error', `进程错误: ${err.message}`));
     this.proc.on('exit', (code, signal) => {
-      this._log('warn', `BDS 进程退出 code=${code} signal=${signal}`);
+      this._log('warn', `${this._paper ? 'Paper' : 'BDS'} 进程退出 code=${code} signal=${signal}`);
       const crashed = this.running && !this._restarting;
       this.proc = null; this.pid = null; this.running = false;
       // 清理活动命令
@@ -142,7 +155,11 @@ class BDS extends EventEmitter {
     return new Promise((resolve) => {
       const t0 = Date.now();
       const timer = setInterval(() => {
-        if (this._logBuffer.some(l => l.includes('Server started') || l.includes('IPv6 supported'))) {
+        // BDS: "Server started"/"IPv6 supported" | Paper: "Done (Xs)!"
+        const ok = this._paper
+          ? this._logBuffer.some(l => l.includes('Done ('))
+          : this._logBuffer.some(l => l.includes('Server started') || l.includes('IPv6 supported'));
+        if (ok) {
           clearInterval(timer); resolve();
         } else if (Date.now() - t0 > timeoutMs) {
           clearInterval(timer); resolve(); // 超时视为已启动(部分版本日志不同)
@@ -154,15 +171,20 @@ class BDS extends EventEmitter {
   async stop() {
     if (!this.proc) return;
     this._restarting = true;
-    this._log('info', '正在停止 BDS ...');
-    // console 通道: save hold 后 stop
-    try { await this.exec('save hold', 8000).catch(() => {}); } catch {}
-    try { await this.exec('stop', 10000).catch(() => {}); } catch {}
+    this._log('info', `正在停止 ${this._paper ? 'Paper' : 'BDS'} ...`);
+    if (this._paper) {
+      // Paper: RCON stop (自动保存世界后退出)
+      try { await this.rcon.exec('stop'); } catch {}
+    } else {
+      // console 通道: save hold 后 stop
+      try { await this.exec('save hold', 8000).catch(() => {}); } catch {}
+      try { await this.exec('stop', 10000).catch(() => {}); } catch {}
+    }
     // 等待退出, 最长 30s
     const t0 = Date.now();
     while (this.proc && Date.now() - t0 < 30000) await new Promise(r => setTimeout(r, 200));
     if (this.proc) {
-      this._log('warn', 'BDS 未在 30s 内退出, 强制终止');
+      this._log('warn', '服务端未在 30s 内退出, 强制终止');
       try { this.proc.kill('SIGKILL'); } catch {}
     }
     this._restarting = false;

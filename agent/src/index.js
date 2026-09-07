@@ -435,16 +435,18 @@ function collectMemCpu() {
   } catch { /* proc 不可用时忽略 */ }
 }
 
-async function collectPlayers() {
-  try {
-    const out = await rcon.exec('list');
-    const m = String(out).match(/There are (\d+)\/(\d+) players online:?\s*(.*)/i);
-    if (m) {
-      state.players = m[3] ? m[3].split(',').map(s => s.trim()).filter(Boolean) : [];
-    }
-  } catch { state.players = []; }
-  return state.players;
-}
+  async function collectPlayers() {
+    try {
+      const out = await rcon.exec('list');
+      const s = String(out);
+      // BDS: "There are 0/20 players online:" | Java: "There are 1 of a max of 20 players online: Steve"
+      const m = s.match(/There are (\d+)(?:\/(\d+)|\s+of a max of\s+(\d+)) players online:\?\s*(.*)/i);
+      if (m) {
+        state.players = m[4] ? m[4].split(',').map(x => x.trim()).filter(Boolean) : [];
+      }
+    } catch { state.players = []; }
+    return state.players;
+  }
 
 async function collectStatus() {
   collectMemCpu();
@@ -482,10 +484,18 @@ bds.on('log', (line) => {
   if (!line) return;
   _logBatch.push(line);
   if (_logBatch.length > 200) { _logBatch.shift(); }
-  const join = line.match(/Player connected: (.+?), xuid:/i);
-  if (join && !state.players.includes(join[1])) state.players.push(join[1]);
-  const leave = line.match(/Player disconnected: (.+?), xuid:/i);
-  if (leave) state.players = state.players.filter(p => p !== leave[1]);
+  if (config.bds.mode === 'paper') {
+    // Java/Paper 日志: "Steve joined the game" / "Steve left the game" / "... lost connection: ..."
+    const jj = line.match(/\]\s+(\S+) joined the game/i);
+    if (jj && !state.players.includes(jj[1])) state.players.push(jj[1]);
+    const ll = line.match(/\]\s+(\S+) (?:left the game|lost connection)/i);
+    if (ll) state.players = state.players.filter(p => p !== ll[1]);
+  } else {
+    const join = line.match(/Player connected: (.+?), xuid:/i);
+    if (join && !state.players.includes(join[1])) state.players.push(join[1]);
+    const leave = line.match(/Player disconnected: (.+?), xuid:/i);
+    if (leave) state.players = state.players.filter(p => p !== leave[1]);
+  }
 });
 
 // 自动备份 (定时全量, kind=auto; 与手动/死亡备份独立)
@@ -503,7 +513,7 @@ if (config.backup.auto) {
   console.log(`[MC1life] 死亡自动备份: ${config.deathBackup?.enabled ? 'ON' : 'OFF'}`);
   worlds.refreshCache();
   if (!bds.running) {
-    console.log('[MC1life] BDS 未运行, 自动启动...');
+    console.log(`[MC1life] ${config.bds.mode === 'paper' ? 'Paper' : 'BDS'} 未运行, 自动启动...`);
     try { await bds.start(); } catch (e) { console.error('[MC1life] 自动启动失败', e.message); }
   }
   poll.connect();
