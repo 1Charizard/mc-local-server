@@ -74,7 +74,8 @@ export const setDeathBackup = (enabled, keepPerPlayer) => req('/api/deathbackup'
 export const getWorlds = () => req('/api/worlds');
 export const switchWorld = (name) => req('/api/worlds/switch', { method: 'POST', body: JSON.stringify({ name }) });
 export const deleteWorld = (name) => req('/api/worlds/delete', { method: 'POST', body: JSON.stringify({ name }) });
-export const exportWorld = (name) => req('/api/worlds/export', { method: 'POST', body: JSON.stringify({ name }) });
+export const exportWorld = (name, source) => req('/api/worlds/export', { method: 'POST', body: JSON.stringify({ name, source }) });
+export const getStaging = () => req('/api/worlds/staging');
 export const exportWorldUrl = (id) => `${API_BASE}/api/worlds/export/meta?id=${encodeURIComponent(id)}`;
 // 下载导出存档: 循环拉 base64 分片 -> 前端拼 Blob 下载 (绕开 Worker CPU 限制)
 export async function downloadExport(id) {

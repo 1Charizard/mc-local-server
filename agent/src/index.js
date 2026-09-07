@@ -163,7 +163,8 @@ async function dispatch(kind, p) {
       worlds.refreshCache();
       return r;
     }
-    case 'worldExport': return await exportWorld(p.name);
+    case "worldExport": return await exportWorld(p.name, p.source);
+    case "listStaging": return await worlds.listStaging();
     case 'uploadWorld': return await worlds.upload(p.url, p.name);
     case 'getHardcore': return { enabled: !!config.hardcore?.enabled, mode: config.hardcore?.mode || 'wipe' };
     case 'setHardcore': {

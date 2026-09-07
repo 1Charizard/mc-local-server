@@ -53,12 +53,40 @@
       <h3>结果</h3>
       <pre class="result">{{ result }}</pre>
     </div>
+
+    <div class="panel">
+      <h3>🔄 存档转换 (基岩 ↔ Java)</h3>
+      <p class="tip">
+        服务器为 Java 版 (Paper)，基岩存档需先转成 Java 格式才能游玩。步骤：<br />
+        1️⃣ 在下方「待转换区」点 <b>⬇️ 导出</b> 下载 .tar.gz（即基岩存档原档）<br />
+        2️⃣ 打开 <a href="https://chunker.app" target="_blank" rel="noopener">chunker.app</a>，上传刚下载的文件，格式选 Bedrock → Java，转换后下载<br />
+        3️⃣ 回到上方「网页上传自定义存档」上传转换后的 zip，导入成功后即可在列表中切换游玩<br />
+        ⚠️ 转换为 Java 版后玩家背包/坐标可能丢失（Chunker 特性），重要物品请提前整理。
+      </p>
+      <h3 style="margin-top:14px">📥 待转换区 (worlds-staging)</h3>
+      <div v-if="!staging.length" class="empty">待转换区为空（基岩版存档上传后会自动进入这里）</div>
+      <table v-else>
+        <thead><tr><th>存档名</th><th>格式</th><th>大小</th><th>上传时间</th><th>操作</th></tr></thead>
+        <tbody>
+          <tr v-for="s in staging" :key="s.name">
+            <td>{{ s.name }}</td>
+            <td><span class="tag">{{ s.note || s.format }}</span></td>
+            <td>{{ fmtSize(s.size) }}</td>
+            <td>{{ new Date(s.mtime).toLocaleString() }}</td>
+            <td class="ops">
+              <button v-if="isAdmin" class="mini ok" @click="doExportStaging(s.name)">⬇️ 导出</button>
+              <span v-if="!isAdmin" class="tip">只读</span>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
   </div>
 </template>
 
 <script setup>
 import { ref, onMounted } from 'vue';
-import { getWorlds, switchWorld, deleteWorld, renameWorld, uploadWorld, uploadWorldFile, exportWorld, downloadExport, getRole } from '../api';
+import { getWorlds, switchWorld, deleteWorld, renameWorld, uploadWorld, uploadWorldFile, exportWorld, downloadExport, getStaging, getRole } from '../api';
 
 const worlds = ref([]);
 const url = ref('');
@@ -71,6 +99,7 @@ const uploading = ref(false);
 const progress = ref(0);
 const doneChunks = ref(0);
 const totalChunks = ref(0);
+const staging = ref([]);
 
 function fmtSize(b) {
   if (!b) return '—';
@@ -78,7 +107,12 @@ function fmtSize(b) {
   if (b > 1048576) return (b / 1048576).toFixed(1) + ' MB';
   return Math.round(b / 1024) + ' KB';
 }
-async function refresh() { try { worlds.value = (await getWorlds()).result || []; } catch (e) { result.value = `加载失败: ${e.message}`; } }
+async function refresh() {
+  try {
+    worlds.value = (await getWorlds()).result || [];
+  } catch (e) { result.value = `加载失败: ${e.message}`; }
+  try { staging.value = (await getStaging()).result || []; } catch (e) { /* 待转换区拉取失败不阻塞主列表 */ }
+}
 async function doExport(name) {
   if (!confirm(`确定导出世界「${name}」吗？将打包为 tar.gz 下载。`)) return;
   result.value = '正在导出世界 (打包+上传 R2，大世界需要一点时间)...';
@@ -95,6 +129,25 @@ async function doExport(name) {
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
+  } catch (e) { result.value = `导出失败: ${e.message}`; }
+}
+async function doExportStaging(name) {
+  if (!confirm(`确定导出待转换区存档「${name}」吗？将打包为 tar.gz 下载（用 chunker.app 转 Java）。`)) return;
+  result.value = '正在导出待转换区存档 (打包+上传，大档需要一点时间)...';
+  try {
+    const r = await exportWorld(name, 'staging');
+    if (!r.ok) throw new Error(r.error || '导出失败');
+    result.value = `导出完成 (${fmtSize(r.size)})，开始下载...`;
+    const { blob, fileName } = await downloadExport(r.exportId);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fileName;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    result.value = `✅ 已下载 ${fileName}。下一步: chunker.app 转 Java → 上传回来`;
   } catch (e) { result.value = `导出失败: ${e.message}`; }
 }
 async function doDelete(name) {
