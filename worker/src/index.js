@@ -700,7 +700,7 @@ app.post('/api/packs/upload/start', async (c) => {
   if (!fileName || !size) return c.json({ ok: false, error: '缺少参数 (fileName/size)' }, 400);
   if (size > MAX_UPLOAD) return c.json({ ok: false, error: `文件过大 (${(size/1048576).toFixed(1)}MB), 上限 500MB` }, 400);
   if (size <= 0) return c.json({ ok: false, error: '文件为空' }, 400);
-  if (type && !['behavior', 'resource'].includes(type)) return c.json({ ok: false, error: 'type 仅支持 behavior/resource' }, 400);
+  if (type && !['behavior', 'resource', 'datapack', 'resource-java', 'resource-bedrock'].includes(type)) return c.json({ ok: false, error: 'type 不支持: '+type }, 400);
   if (!(await agentOnline(c.env))) return c.json({ ok: false, error: 'Agent 当前离线, 无法上传包' }, 503);
   const uploadId = crypto.randomUUID().slice(0, 8);
   const totalChunks = Math.ceil(size / UPLOAD_CHUNK);
