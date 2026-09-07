@@ -215,9 +215,10 @@ function saveHardcoreConfig(obj, key = 'hardcore') {
 }
 
 // ---------- 导出世界: 打包 -> 分片上传 Worker KV (不依赖 R2) ----------
-async function exportWorld(worldName) {
+async function exportWorld(worldName, source) {
   if (!worldName) throw new Error('缺少世界名');
-  const worldDir = path.join(config.bds.worldDir, worldName);
+  const baseDir = source === 'staging' ? (config.bds.stagingDir || config.bds.worldDir + '-staging') : config.bds.worldDir;
+  const worldDir = path.join(baseDir, worldName);
   if (!fs.existsSync(path.join(worldDir, 'level.dat'))) {
     throw new Error(`世界不存在或无效: ${worldName}`);
   }
@@ -228,7 +229,7 @@ async function exportWorld(worldName) {
   // 1. 打包单个世界目录
   await new Promise((resolve, reject) => {
     const { execFile } = require('child_process');
-    execFile('tar', ['-czf', tmpFile, '--exclude=*.tmp', '--exclude=session.lock', worldName], { cwd: config.bds.worldDir, maxBuffer: 128 * 1024 * 1024 }, (err) => err ? reject(err) : resolve());
+    execFile('tar', ['-czf', tmpFile, '--exclude=*.tmp', '--exclude=session.lock', worldName], { cwd: baseDir, maxBuffer: 128 * 1024 * 1024 }, (err) => err ? reject(err) : resolve());
   });
 
   try {
@@ -483,6 +484,7 @@ async function collectStatus() {
     hardcore: { enabled: !!config.hardcore?.enabled, mode: config.hardcore?.mode || 'wipe' },
     deathBackup: { enabled: !!config.deathBackup?.enabled, keepPerPlayer: config.deathBackup?.keepPerPlayer, keepGlobal: config.deathBackup?.keepGlobal },
     worlds: await worlds.getCached(),
+    staging: await worlds.listStaging().catch(() => []),
     ts: Date.now(),
   };
 }

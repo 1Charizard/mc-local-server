@@ -13,6 +13,7 @@ class Worlds {
     this.cfg = bdsCfg;
     this.bds = bds;
     this.worldDir = bdsCfg.worldDir || path.join(bdsCfg.dir, 'worlds');
+    this.stagingDir = bdsCfg.stagingDir || (this.worldDir + '-staging');
     this._cache = null;
   }
 
@@ -45,6 +46,27 @@ class Worlds {
   async getCached() {
     if (!this._cache) await this.refreshCache();
     return this._cache || [];
+  }
+
+  /** 列出待转换区 (worlds-staging/) 的基岩档 */
+  async listStaging() {
+    if (!fs.existsSync(this.stagingDir)) return [];
+    const out = [];
+    for (const entry of fs.readdirSync(this.stagingDir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const dir = path.join(this.stagingDir, entry.name);
+      if (!fs.existsSync(path.join(dir, 'level.dat'))) continue;
+      const stat = fs.statSync(dir);
+      const isBedrock = fs.existsSync(path.join(dir, 'db'));
+      out.push({
+        name: entry.name,
+        size: await this._dirSize(dir),
+        mtime: stat.mtime,
+        format: isBedrock ? 'bedrock' : 'java',   // 理论全基岩, 双保险检测
+        note: isBedrock ? '基岩版·待转换' : 'Java',
+      });
+    }
+    return out.sort((a, b) => b.mtime - a.mtime);
   }
 
   /** 列出 worlds/ 下的所有世界 */
@@ -225,14 +247,18 @@ class Worlds {
       hits.sort((a, b) => a.depth - b.depth || a.dir.length - b.dir.length);
       const worldRoot = hits[0].dir;
       if (hits.length > 1) console.log(`[MC1life] 存档内含多个 level.dat (${hits.length} 个), 取最浅: ${path.relative(staging, worldRoot)}`);
-      // 3) 确定世界名
+      // 2.5) 格式判定: 世界根含 db/ (LevelDB) = 基岩档; 否则 Java (region/)
+      const isBedrock = fs.existsSync(path.join(worldRoot, 'db'));
+      // 3) 确定世界名 (基岩档落入 stagingDir 待转换区, 不进入可玩 worldDir)
+      const destRoot = isBedrock ? this.stagingDir : this.worldDir;
+      fs.mkdirSync(destRoot, { recursive: true });
       const baseName = this._pickWorldName(staging, worldRoot, name);
       let targetName = baseName;
-      target = path.join(this.worldDir, targetName);
+      target = path.join(destRoot, targetName);
       let n = 2;
       while (fs.existsSync(target)) {
         targetName = `${baseName}_${n}`;
-        target = path.join(this.worldDir, targetName);
+        target = path.join(destRoot, targetName);
         n++;
       }
       // 4) 上移世界根内容到最终目录 (跳过打包夹带的垃圾项)
@@ -254,8 +280,14 @@ class Worlds {
         fs.rmSync(target, { recursive: true, force: true });
         throw new Error('上传的存档缺少 level.dat, 可能不是有效的 Minecraft 世界');
       }
-      console.log(`[MC1life] 世界导入成功: ${path.basename(target)} (内容来自 ${path.relative(staging, worldRoot) || 'zip 根'})`);
-      return { world: path.basename(target), ok: true };
+      const format = isBedrock ? 'bedrock' : 'java';
+      console.log(`[MC1life] 世界导入成功: ${path.basename(target)} (${format}, 来自 ${path.relative(staging, worldRoot) || 'zip 根'})`);
+      return {
+        world: path.basename(target), ok: true, format,
+        note: isBedrock
+          ? '检测为基岩版存档, 已存入「待转换区」(未设为当前世界, 避免 Java 服务端无法加载)。请到「存档转换」导出并用 Chunker 转成 Java 版后重新导入。'
+          : '检测为 Java 版存档, 已存入可玩世界库。',
+      };
     } catch (e) {
       // 失败时清理已建的目标目录 (避免残留空目录/半成品)
       if (target && fs.existsSync(target)) fs.rmSync(target, { recursive: true, force: true });
