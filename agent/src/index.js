@@ -88,7 +88,7 @@ const poll = new WS(config, {
           const result = await dispatch(kind, payload || {});
           return { ok: true, result };
         } catch (err) {
-          console.error('[MC1life] 指令失败:', kind, err.message);
+          console.error('[MC1life] 指令失败:', kind, err.message, err.errors ? '| errors=' + JSON.stringify(err.errors.map(e => e && e.message)) : '', err.stack ? '| ' + err.stack.split('\n').slice(0, 3).join(' ') : '');
           return { ok: false, error: err.message || String(err) };
         }
       }
@@ -294,15 +294,28 @@ async function pullUploadChunks(uploadId, totalChunks, fileName) {
     req.setTimeout(60000, () => req.destroy(new Error(`分片 ${i} 拉取超时`)));
   });
   const chunks = [];
-  const CONC = 8;
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  // 单分片带重试 (D1/网络偶发失败)
+  const fetchRetry = async (idx) => {
+    let lastErr;
+    for (let k = 0; k < 3; k++) {
+      try {
+        const r = await fetchChunk(idx);
+        if (r.status !== 200) throw new Error(`HTTP ${r.status}`);
+        return Buffer.from(r.body, 'base64');
+      } catch (e) {
+        lastErr = e;
+        await sleep(400 * (k + 1));
+      }
+    }
+    throw new Error(`分片 ${idx} 拉取失败: ${lastErr && lastErr.message}`);
+  };
+  const CONC = 4;  // 降低并发, 减少 D1 压力/偶发失败
   for (let i = 0; i < totalChunks; i += CONC) {
     const batch = [];
-    for (let j = i; j < Math.min(i + CONC, totalChunks); j++) batch.push(fetchChunk(j));
+    for (let j = i; j < Math.min(i + CONC, totalChunks); j++) batch.push(fetchRetry(j));
     const results = await Promise.all(batch);
-    results.forEach((r, idx) => {
-      if (r.status !== 200) throw new Error(`分片 ${i + idx} 拉取失败 HTTP ${r.status}`);
-      chunks[i + idx] = Buffer.from(r.body, 'base64');
-    });
+    results.forEach((buf, idx) => { chunks[i + idx] = buf; });
     if (i % 16 === 0) console.log(`[MC1life] 拉取分片 ${Math.min(i + CONC, totalChunks)}/${totalChunks}`);
   }
   const full = Buffer.concat(chunks);
@@ -454,7 +467,7 @@ async function collectStatus() {
   state.uptime = bds.running && state.startedAt ? Math.round((Date.now() - state.startedAt) / 1000) : 0;
   await collectPlayers();
   const props = await cfg.readProperties();
-  state.world = props['level-name'] || '';
+  state.world = worlds.getActiveName();
   return {
     agentId: config.agentId,
     running: state.running,

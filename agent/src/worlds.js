@@ -16,6 +16,25 @@ class Worlds {
     this._cache = null;
   }
 
+
+  /** 当前活动世界名: bds 读 server.properties level-name; paper 解析 javaDir/<level-name> symlink (level-name 恒为 world) */
+  _activeName() {
+    const props = this._readProps();
+    const lvl = (props['level-name'] || 'world').replace(/\r/g, '');
+    if (this.cfg.mode === 'paper') {
+      const link = path.join(this.cfg.dir, lvl);
+      try {
+        const real = fs.realpathSync(link);
+        const base = path.basename(real);
+        if (base && base !== lvl) return base;
+      } catch {}
+      return lvl;
+    }
+    return lvl;
+  }
+  /** 公开: 当前活动世界名 (状态上报用) */
+  getActiveName() { return this._activeName(); }
+
   /** 刷新世界列表缓存 (导入/切换后调用, 心跳上报用) */
   async refreshCache() {
     try { this._cache = await this.list(); } catch (e) { console.error('[MC1life] 世界列表缓存刷新失败:', e.message); }
@@ -33,7 +52,7 @@ class Worlds {
     if (!fs.existsSync(this.worldDir)) return [];
     const out = [];
     const props = await this._readProps();
-    const current = (props['level-name'] || 'Bedrock level').replace(/\r/g, '');
+    const current = this._activeName();
     for (const entry of fs.readdirSync(this.worldDir, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
       const dir = path.join(this.worldDir, entry.name);
@@ -56,6 +75,17 @@ class Worlds {
   async switchTo(name) {
     const worlds = await this.list();
     if (!worlds.some(w => w.name === name)) throw new Error(`世界不存在: ${name}`);
+    if (this.cfg.mode === 'paper') {
+      // paper: level-name 固定 (javaDir/<level-name> 为 symlink) → 切换 = 更新 symlink + 重启
+      const props = await this._readProps();
+      const lvl = (props['level-name'] || 'world').replace(/\r/g, '');
+      const link = path.join(this.cfg.dir, lvl);
+      try { fs.unlinkSync(link); } catch {}
+      fs.symlinkSync(path.join(this.worldDir, name), link);
+      console.log(`[MC1life] Paper 世界切换: ${name} (symlink ${lvl} -> worlds/${name})`);
+      if (this.bds.running) await this.bds.restart();
+      return { switchedTo: name };
+    }
     const propsPath = path.join(this.cfg.dir, 'server.properties');
     const props = await this._readProps();
     props['level-name'] = name;
@@ -87,21 +117,31 @@ class Worlds {
 
     // 读 props, 判断是否当前世界
     const props = await this._readProps();
-    const current = (props['level-name'] || 'Bedrock level').replace(/\r/g, '');
+    const current = this._activeName();
     const isCurrent = oldName === current;
 
     fs.renameSync(oldDir, newDir);
     // 同步 levelname.txt (玩家看到的显示名)
     const lnPath = path.join(newDir, 'levelname.txt');
     try { fs.writeFileSync(lnPath, clean, 'utf8'); } catch {}
-    // 若为当前世界, 更新 server.properties 并重启
+    // 若为当前世界: bds 更新 server.properties; paper 更新 symlink 目标 (level-name 恒 world)
     let restarted = false;
     if (isCurrent) {
-      props['level-name'] = clean;
-      await this._writeProps(path.join(this.cfg.dir, 'server.properties'), props);
-      if (this.bds.running) {
-        await this.bds.restart();
-        restarted = true;
+      if (this.cfg.mode === 'paper') {
+        const props2 = await this._readProps();
+        const lvl = (props2['level-name'] || 'world').replace(/\r/g, '');
+        const link = path.join(this.cfg.dir, lvl);
+        try { fs.unlinkSync(link); } catch {}
+        fs.symlinkSync(path.join(this.worldDir, clean), link);
+        console.log(`[MC1life] Paper 世界重命名: ${oldName} -> ${clean} (symlink 更新)`);
+        if (this.bds.running) { await this.bds.restart(); restarted = true; }
+      } else {
+        props['level-name'] = clean;
+        await this._writeProps(path.join(this.cfg.dir, 'server.properties'), props);
+        if (this.bds.running) {
+          await this.bds.restart();
+          restarted = true;
+        }
       }
     }
     await this.refreshCache();
@@ -125,7 +165,7 @@ class Worlds {
     if (!fs.existsSync(target)) throw new Error(`世界不存在: ${name}`);
     // 禁止删除当前正在使用的世界
     const props = await this._readProps();
-    const current = (props['level-name'] || 'Bedrock level').replace(/\r/g, '');
+    const current = this._activeName();
     if (name === current) throw new Error(`「${name}」是当前使用的世界, 请先切换到其他世界再删除`);
     fs.rmSync(target, { recursive: true, force: true });
     this.refreshCache();
