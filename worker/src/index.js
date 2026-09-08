@@ -552,19 +552,12 @@ app.post('/api/worlds/delete', async (c) => {
   const r = await submitCmd(c.env, 'deleteWorld', { name }, 60000);
   return c.json(r);
 });
-// 待转换区 (基岩档, 尚未转 Java)
-app.get('/api/worlds/staging', async (c) => {
-  const r = await submitCmd(c.env, 'listStaging', {}, 30000);
-  if (r.ok && r.result && typeof r.result === 'object' && !Array.isArray(r.result)) return c.json({ ok: true, ...r.result });
-  return c.json(r);
-});
 // 导出世界: Agent 打包分片上传 KV -> 返回 exportId (不依赖 R2)
 app.post('/api/worlds/export', async (c) => {
-  const { name, source } = await c.req.json();
+  const { name } = await c.req.json();
   if (!name) return c.json({ ok: false, error: '缺少世界名' });
-  if (source && !['worlds', 'staging'].includes(source)) return c.json({ ok: false, error: 'source 仅支持 worlds/staging' }, 400);
-  await logAudit(c.env, 'admin', 'world_export', `${source === 'staging' ? '[待转换]' : ''}${name}`);
-  const r = await submitCmd(c.env, 'worldExport', { name, source }, 300000);
+  await logAudit(c.env, 'admin', 'world_export', name);
+  const r = await submitCmd(c.env, 'worldExport', { name }, 300000);
   // 平铺 result (submitCmd 包成 {ok,result}, 前端需顶层 exportId/fileName)
   if (r.ok && r.result && typeof r.result === 'object') return c.json({ ok: true, ...r.result });
   return c.json(r);
