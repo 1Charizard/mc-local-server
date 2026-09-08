@@ -1,6 +1,40 @@
-# MC1life — 本地部署方案（旧安卓手机 + 内网穿透）v2
+# MC1life — 部署方案演进记录
 
-> 更新于 2026-08-30 · 变更：放弃 Oracle 免费层，改为用户本地旧安卓手机部署 + 内网穿透
+> 更新于 2026-09-08 · 当前阶段：**Phase 0 完成（Paper 迁移）→ 生产运行于阿里云 ECS**
+
+## 阶段总览
+
+| 阶段 | 方案 | 状态 |
+|---|---|---|
+| v1 | CF Workers 全托管 | ❌ Workers 跑不了游戏服 |
+| v2 | 旧安卓手机 (Termux+box64) + BDS + IPv6 直连 | ✅ 跑通过，性能受限 |
+| **Phase 0 (当前)** | **阿里云 ECS + Paper 26.2 + Geyser 双端互通** | ✅ **生产运行中** |
+
+## Phase 0: Paper 迁移（当前）
+
+### 动机
+- 基岩 BDS 无法与 Java 玩家互通；Geyser + Paper 实现双端同服
+- box64 模拟 x86 BDS CPU 开销 2.5 倍，2核机扛不住；Paper 是原生 aarch64 Java
+- 阿里云 2核/1.6G ECS 代替手机 7×24 开机
+
+### 完成项
+- [x] swap 2G + JDK 25 + 全量备份
+- [x] Paper 26.2 (build 121) + Geyser 2.11.2 + Floodgate 2.2.5
+- [x] 双端进服验证（Java 1.21.x 电脑 + 基岩 1.21.90 手机）
+- [x] Agent paper 引擎模式（RCON/Done 检测/世界 symlink 切换/玩家列表）
+- [x] 包管理 Java 化（数据包 + 双平台材质包分类）
+- [x] 存档导入分流（基岩档自动进待转换区防崩）
+- [x] 玩家列表修复（Paper list 输出无问号的正则适配）
+- [x] 性能调优：G1GC 替换 SerialGC + 实体/合并参数（见 java/README.md）
+
+### 已知问题
+- 1.6G 内存偏紧（RSS ~1.1G），人多会 thrash —— 长期建议升级 4G
+- 中文玩家名无法连 Java 端（需英文 ID；基岩经 Floodgate 自动前缀）
+- 基岩存档需转换工具（Chunker 等）转 Java 格式才能加载
+
+---
+
+# 以下为历史方案存档（v2: 手机部署）
 
 ## 0. 方案变更原因
 

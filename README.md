@@ -1,22 +1,29 @@
-# ⛏️ MC1life — 我的世界基岩版 1.21.90 服务器 + 后台管理系统
+# ⛏️ MC1life — 我的世界双端互通服务器 + 网页管理面板
 
-免费方案：**Cloudflare 免费层（面板/API/备份）+ 本地（Termux）跑 BDS**
+Java 版（Paper）+ 基岩版（Geyser 互通）双端同服，Cloudflare 免费层承载管理面板/API。
+
+> 当前生产：阿里云 ECS（2核/1.6G/Ubuntu）跑 **Paper 26.2 + Geyser 2.11 + Floodgate 2.2**
+> 电脑玩家（Java 1.21.x）与手机玩家（基岩 1.21.90）同世界联机
 
 ## 架构
 
 ```
-玩家(手机/主机) ──UDP 19133 IPv6 直连──▶ 设备
-                                       │  Termux + proot Debian + box64
-                                       │  BDS 1.21.90.4 + 行为包
-                                       │  Agent (Node.js 出站 WS 连接)
-                                       ▼
-                              Cloudflare 免费层
-                    Pages 面板 · Workers API/WS · R2 备份 · D1 审计
+Java 玩家 (电脑) ──TCP 25565──┐
+                              ├──▶ 阿里云 ECS (121.43.x.x)
+基岩玩家 (手机) ──UDP 19132──┤      │  Paper 26.2 (Java 服务端)
+                              │      │  + Geyser (基岩协议转译)
+                              │      │  + Floodgate (基岩登录免 Java 账号)
+                              │      │  + Agent (Node.js, systemd 托管)
+                              ▼      ▼
+                       Cloudflare 免费层
+              Pages 面板 · Workers API · D1 (指令队列/审计/分片)
 ```
 
-- 玩家进服：IPv6 直连 `[家宽IPv6]:19133`（基岩版协议走 UDP，家宽 IPv6 免费零延迟）
-- 管理通道：Agent **主动出站** WebSocket 连到 Worker —— 手机无需公网入站端口/隧道
-- 备份：Agent 打包 worlds → R2（设备）
+- **管理通道**：Agent 主动出站 HTTPS 轮询 Worker（服务器无需开放额外管理端口）
+- **上传/备份/导出**：分片经 D1 staging 中转（绕开 R2 TLS 阻断与 CF 100MB 单请求限制）
+- **玩家连接**：
+  - Java：`121.43.166.46:25565`（协议兼容 1.21 ~ 1.21.10）
+  - 基岩：`121.43.166.46:19132`（Geyser 转译）
 
 ## 功能
 
@@ -24,84 +31,94 @@
 |---|---|
 | 仪表盘 | 运行状态 / 在线玩家 / 内存 / CPU / 运行时长 / 版本 |
 | 控制台 | 任意指令下发 (RCON) + 实时日志流 + 常用指令提示 |
-| 玩家管理 | 在线列表 / 踢人 / 封禁解封 / OP 授予撤销 |
-| 存档管理 | 世界列表 / 一键切换 / URL 上传自定义存档 (.zip/.mcworld/.tar.gz) |
-| 备份回滚 | 手动/定时备份 → R2（自动保留最近 N 份）/ 一键回滚 |
-| 服务器设置 | server.properties 可视化编辑 + 重启生效 |
-| 扩展 | 崩溃自动重启 (5s) / Agent 断线重连 / 行为包部署脚本 |
+| 玩家管理 | 在线列表 / 踢人 / 封禁（永久/限时/解封/改时间） / OP 授予撤销（游戏内通知） |
+| 存档管理 | 世界列表 / 切换 / 重命名 / 删除 / 网页分片上传（≤500MB）/ URL 拉取 / 导出下载 |
+| 备份回滚 | 手动备份 → Worker 分片通道（自动保留 N 份）/ 一键回滚 |
+| 死亡备份 | 玩家死亡自动快照（背包/血量/位置），面板独立开关 |
+| 组件库 | 数据包（Java）/ 双平台材质包分类上传，按世界独立启停 |
+| 硬核模式 | 可开关；wipe（删档）/ ban（封禁）两种惩罚 |
+| 服务器设置 | server.properties / spigot.yml 可视化编辑 + 重启生效 |
 
 ## 目录结构
 
 ```
 mc1life/
-├── bds/        BDS 1.21.90.4 安装/行为包部署/systemd 服务
-├── agent/      Node.js 管理代理 (运行在游戏服主机)
-├── worker/     Cloudflare Worker (REST API + WS 网关 + D1 schema)
-├── panel/      Vue3 管理面板 (构建后发布到 CF Pages)
-└── deploy/     VPS 一键部署 + CF 资源发布脚本
+├── agent/      Node.js 管理代理（跑在游戏服主机，systemd: mc1life-agent）
+├── worker/     Cloudflare Worker（REST API + 指令队列 + 分片 staging）
+├── panel/      Vue3 管理面板（构建后发布 CF Pages，_worker.js 代理 /api）
+├── bds/        旧 BDS 方案存档（已迁 Paper，保留参考）
+├── deploy/     Termux/VPS/CF 部署脚本
+└── java/       Paper 服务端部署说明与调优记录（服务器生成，配置文档化在此）
 ```
 
 ## 部署步骤
 
-### 一、游戏服主机（本地服务器）
+### 一、游戏服主机（阿里云 ECS / 任意 VPS）
 
-   实测用的是荣耀8X
-
-> ⚠️ 性能提示：BDS 官方只有 x86_64 版，在 ARM 手机需 box64 模拟（CPU 开销约 2.5 倍）。
-> 荣耀 8X（麒麟710/4GB）实测可跑小服（≤8 人，view-distance 12），但世界生成较慢。
-> 内存 ≥6GB 的中端手机体验更好。
-
-1. 安装 Termux（GitHub release APK：https://github.com/termux/termux-app/releases）
-2. 把本项目放到手机存储 `/sdcard/mc1life`（git clone 或传输）
-3. 在 Termux 执行一键部署：
+要求：1G 内存起步（推荐 ≥2G）；Java 21+（Paper 26.2 实测用 JDK 25）。
 
 ```bash
-termux-setup-storage   # 授权存储访问
-bash /sdcard/mc1life/deploy/termux_setup.sh
+# 1. 基础环境
+apt update && apt install -y openjdk-25-jre-headless nodejs npm
+
+# 2. 用户与目录
+useradd -r -m mc1life
+mkdir -p /opt/mc1life/{java,agent,worlds}
+
+# 3. Paper 服务端（自动下载 jar + 接受 eula）
+cd /opt/mc1life/java
+# 从 https://papermc.io/downloads 下载 paper-<version>.jar 重命名 paper.jar
+echo "eula=true" > eula.txt
+
+# 4. Geyser + Floodgate 插件（基岩互通）
+mkdir plugins && cd plugins
+wget https://download.geysermc.org/v2/projects/geyser/regions/builds/latest/downloads/spigot -O Geyser.jar
+wget https://download.geysermc.org/v2/projects/floodgate/regions/builds/latest/downloads/spigot -O Floodgate.jar
+
+# 5. Agent
+cp -r <repo>/agent /opt/mc1life/agent
+cd /opt/mc1life/agent && npm ci
+cp config.json.example config.json   # 填 workerUrl/token
+cp <repo>/agent/mc1life-agent.service /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now mc1life-agent
 ```
 
-脚本自动：装 proot Debian → box64 + x86 库 → 下载 BDS 1.21.90.4 → 生成低配优化配置 → 测试启动 → 打印 IPv6 连接地址。
+> Agent 会自动拉起 Paper（`run.sh`），Paper 崩溃自动重启（5s），无需单独的 server systemd。
 
-4. 部署 Agent（管理通道）：
+### 二、JVM 启动参数（1.6G 小内存机实测调优）
+
+见 `java/run.sh` 文档说明：G1GC 低停顿 + 固定堆，**小服卡顿的关键在 GC 算法**。
+大内存机器（≥4G）可换回常规参数：`-Xms2G -Xmx2G -XX:+UseG1GC`。
+
+### 三、Cloudflare 侧资源
 
 ```bash
-proot-distro login debian -- bash /sdcard/mc1life/deploy/agent_termux.sh
-# 然后编辑 /opt/mc1life/agent/config.json (workerUrl/token/r2)
-cd /opt/mc1life/agent && node src/index.js
+export CLOUDFLARE_API_TOKEN=<token> CLOUDFLARE_ACCOUNT_ID=<account>
+cd worker && npx wrangler deploy                          # API
+npx wrangler pages deploy ../panel/dist --project-name mc1life-panel   # 面板
+npx wrangler d1 execute mc1life --file=./schema.sql --remote           # D1 建表
 ```
 
-### 二、网络（IPv6 直连）
+Secrets 注入（不要写进仓库）：`AGENT_TOKEN` / `PANEL_JWT_SECRET` / `PANEL_AUTH_TOKEN` / `PANEL_VIEWER_TOKEN`。
 
-- 手机连家里 WiFi（确认路由器开了 IPv6）
-- 玩家连接地址：`[手机全局IPv6]:19133`（脚本会自动打印）
-- 若玩家端无 IPv6：可改用 frp 免费服务 UDP 穿透（见 PLAN.md）
+### 四、安全组/防火墙放行
 
-### 二、Cloudflare 侧资源
+| 端口 | 协议 | 用途 |
+|---|---|---|
+| 22 | tcp | SSH 管理 |
+| 25565 | tcp | Java 玩家 |
+| 19132 | udp | 基岩玩家 (Geyser) |
+| 8080 | tcp | 材质包静态分发（基岩端在线装包） |
 
-面板发布到 CF Pages（默认项目名 `mc1life-panel`），Worker 发布到 CF Workers（`mc1life-api`）。
-执行 `bash deploy/cf_publish.sh <你的域名> <R2_KEY_ID> <R2_SECRET>` 自动创建资源并发布。
-面板鉴权 token / Agent token 用 `wrangler secret put` 注入（见 `deploy/cf_status.md`）。
+## 性能调优（1.6G 内存 2核机实测）
 
-### 三、回填 Agent 配置
+完整参数与原理见 [`java/README.md`](java/README.md)。要点：
 
-编辑主机上 `/opt/mc1life/agent/config.json`（参考 `config.json.example`）：
-
-```json
-{
-  "workerUrl": "wss://<你的面板域名>.pages.dev/ws/agent",
-  "token": "<Agent共享密钥, 与 Worker 的 AGENT_TOKEN secret 一致>",
-  "agentId": "mc1life"
-}
-```
-
-重启 Agent：`systemctl restart mc1life-agent`（或 Termux 下 `bash /opt/mc1life/start_agent.sh`）
-
-### 四、行为包（可选，复用 Actions-and-Stuff）
-
-```bash
-bash bds/deploy_packs.sh /opt/mc1life/bds /workspace/mcpack_work/merged_dir
-systemctl restart mc1life-bds
-```
+- **G1GC 替换 SerialGC** —— Serial 全停顿回收是小服卡顿主因
+- 实体激活范围 32→16、刷怪范围 8→4、物品合并 0.5→3.5
+- `prevent-moving-into-unloaded-chunks=true`、`optimize-explosions=true`
+- Geyser `max-players` 100→20（虚高配置白占内存）
+- 视距 view-distance=4 / simulation-distance=3（低配机的合理取舍）
 
 ## 本地开发/测试
 
@@ -118,13 +135,14 @@ cd panel && npm run dev   # 代理 /api 到本地 worker
 
 ## 安全说明
 
-- Agent 令牌即管理权限，务必用强随机值并走 `wrangler secret`
-- 面板建议叠加 **Cloudflare Access**（免费 50 用户）做登录保护
-- R2 备份含完整存档，密钥不要外泄
-- Oracle 免费实例可能被回收，建议定期手动备份 + 保留 R2 冗余
+- 所有凭证走 `wrangler secret` / 服务器本地 `config.json`，**仓库内无任何明文密钥**
+- Agent 令牌即管理权限，务必强随机
+- 面板建议叠加 Cloudflare Access（免费 50 用户）
+- `.credentials/` 目录已 gitignore，仅存在于本地工作区
 
 ## 已知限制
 
-- Cloudflare Workers 无法运行 Minecraft 服务端（无状态/CPU 上限/无 UDP）→ 游戏服必须在 VPS/云主机
-- Cloudflare Tunnel 不支持 UDP → 玩家需直连主机 IP，无法套 CF 加速游戏流量
-- 免费 R2 10GB 存储，按备份轮转策略控制用量
+- 中文玩家名无法进 Java 端（Floodgate 已缓解：基岩玩家自动加前缀，Java 端需英文 ID）
+- 基岩存档不能直接给 Paper 加载 —— 需先用转换工具（如 Chunker）转 Java 格式
+- CF Workers 无法跑游戏服（无 UDP/CPU 上限）—— 游戏服必须在 VPS/云主机
+- 1.6G 内存机适合 ≤4 人小服；人多请升级内存（长期方案 4G+）
