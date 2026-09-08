@@ -455,7 +455,7 @@ function collectMemCpu() {
       const out = await rcon.exec('list');
       const s = String(out);
       // BDS: "There are 0/20 players online:" | Java: "There are 1 of a max of 20 players online: Steve"
-      const m = s.match(/There are (\d+)(?:\/(\d+)|\s+of a max of\s+(\d+)) players online:\?\s*(.*)/i);
+      const m = s.match(/There are (\d+)(?:\/(\d+)|\s+of a max of\s+(\d+)) players online:\s*(.*)/i);
       if (m) {
         state.players = m[4] ? m[4].split(',').map(x => x.trim()).filter(Boolean) : [];
       }
